@@ -12,7 +12,7 @@ This is a modern successor to the older `homebridge-node-alarm-dot-com`. It pigg
 - 🚪 **Contact Sensors** — door/window state in real time
 - 👋 **Motion Sensors** — motion alerts via HomeKit
 - 🔋 **Battery status** on sensors that report it
-- 📡 **Event-driven** — uses pyalarmdotcomajax v0.6+ push-update transport (no polling)
+- 📡 Polling today; ready to switch to pyalarmdotcomajax's push-update transport when it hits stable (0.6.x)
 
 Planned for later releases: locks, thermostats, garage doors, cameras, glass-break, smoke, water.
 
