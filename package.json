@@ -32,6 +32,7 @@
     "watch": "tsc --watch",
     "lint": "eslint src/**/*.ts",
     "format": "prettier --write 'src/**/*.ts' '*.json' '*.md'",
+    "prepare": "npm run build",
     "prepublishOnly": "npm run lint && npm run build",
     "dev": "nodemon --watch src --ext ts --exec 'npm run build'"
   },
