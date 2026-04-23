@@ -99,12 +99,15 @@ export class Bootstrap {
     this.log.debug(`[bootstrap] ensuring ${PYALARMDOTCOMAJAX_SPEC} is installed in venv`);
     // Upgrade pip first — PyPI's older pips struggle with modern wheels.
     await execFileAsync(this.venvPython, ['-m', 'pip', 'install', '--quiet', '--upgrade', 'pip']);
+    // --pre is required because 0.6.x is tagged "beta" on PyPI; it's de-facto stable
+    // (Home Assistant pins this same range), so we opt in to prereleases explicitly.
     await execFileAsync(this.venvPython, [
       '-m',
       'pip',
       'install',
       '--quiet',
       '--upgrade',
+      '--pre',
       PYALARMDOTCOMAJAX_SPEC,
     ]);
     this.log.debug(`[bootstrap] pyalarmdotcomajax install complete`);

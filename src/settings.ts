@@ -12,11 +12,12 @@ export const PLUGIN_NAME = 'homebridge-alarm-dot-com-v2';
 export const MIN_PYTHON_VERSION = '3.13';
 
 /**
- * Version spec for pyalarmdotcomajax. As of 2026-04-23, upstream's stable line is
- * 0.5.x (polling); 0.6.x is in beta (event-driven). We accept the stable line for
- * now; when 0.6 goes GA we'll bump this and switch the daemon to its event transport.
+ * Version spec for pyalarmdotcomajax. Upstream's 0.6.x line is tagged beta but is
+ * the version the Home Assistant integration pins in production (and has been stable
+ * for ~12 months without new beta bumps), so we use it. We require `--pre` on pip
+ * install because pip treats anything with "b9" as a prerelease.
  */
-export const PYALARMDOTCOMAJAX_SPEC = 'pyalarmdotcomajax>=0.5.13,<0.7.0';
+export const PYALARMDOTCOMAJAX_SPEC = 'pyalarmdotcomajax>=0.6.0b9,<0.8.0';
 
 /** Directory (relative to Homebridge storage) where the plugin keeps its private venv and state. */
 export const PLUGIN_STATE_SUBDIR = 'alarm-dot-com-v2';

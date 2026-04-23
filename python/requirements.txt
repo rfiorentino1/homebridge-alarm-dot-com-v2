@@ -1,1 +1,1 @@
-pyalarmdotcomajax>=0.5.13,<0.7.0
+pyalarmdotcomajax>=0.6.0b9,<0.8.0

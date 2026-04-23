@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""JSON-RPC daemon bridging pyalarmdotcomajax to the Homebridge plugin.
+"""JSON-RPC daemon bridging pyalarmdotcomajax 0.6.x to the Homebridge plugin.
 
 Wire protocol: newline-delimited JSON-RPC 2.0 over stdin/stdout.
 
@@ -15,8 +15,6 @@ Notifications from Python → Node:
     device_updated({"device": {...}})
     devices_enumerated({"devices": [...]})
     log({"level": "...", "message": "..."})
-
-Device shapes mirror the TypeScript types in src/types.ts.
 """
 
 from __future__ import annotations
@@ -30,26 +28,31 @@ import sys
 from contextlib import suppress
 from typing import Any, Awaitable, Callable
 
-import aiohttp  # type: ignore[import-untyped]
-
 from pyalarmdotcomajax import (  # type: ignore[import-untyped]
-    AlarmController,
+    AlarmBridge,
     AuthenticationFailed,
-    NotAuthorized,
+    EventBrokerMessage,
+    EventBrokerTopic,
     OtpRequired,
-    TryAgain,
 )
-from pyalarmdotcomajax.devices.partition import Partition  # type: ignore[import-untyped]
-from pyalarmdotcomajax.devices.sensor import Sensor  # type: ignore[import-untyped]
+from pyalarmdotcomajax.models.base import BatteryLevel  # type: ignore[import-untyped]
+from pyalarmdotcomajax.models.partition import (  # type: ignore[import-untyped]
+    Partition,
+    PartitionState,
+)
+from pyalarmdotcomajax.models.sensor import (  # type: ignore[import-untyped]
+    Sensor,
+    SensorState,
+    SensorSubtype,
+)
 
 
 # ---------------------------------------------------------------------------
-# I/O primitives (stdin lines in, JSON-RPC messages out)
+# stdio JSON-RPC plumbing
 # ---------------------------------------------------------------------------
 
 
 async def _stdin_lines() -> "asyncio.Queue[str]":
-    """Pump stdin lines through a queue, one line per item. EOF pushes ''."""
     queue: asyncio.Queue[str] = asyncio.Queue()
     loop = asyncio.get_running_loop()
     reader = asyncio.StreamReader()
@@ -85,73 +88,79 @@ def _emit_log(level: str, message: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Mapping pyalarmdotcomajax device state ↔ our wire format
+# pyalarmdotcomajax 0.6 → wire translation
 # ---------------------------------------------------------------------------
 
 
-# Subtypes we expose (ContactSensor / MotionSensor). Other subtypes (smoke, glass
-# break, freeze, etc.) are left for a future release.
 CONTACT_SUBTYPES = {
-    Sensor.Subtype.CONTACT_SENSOR,
-    Sensor.Subtype.CONTACT_SHOCK_SENSOR,
+    SensorSubtype.CONTACT_SENSOR,
+    SensorSubtype.CONTACT_SHOCK_SENSOR,
 }
 MOTION_SUBTYPES = {
-    Sensor.Subtype.MOTION_SENSOR,
-    Sensor.Subtype.PANEL_MOTION_SENSOR,
+    SensorSubtype.MOTION_SENSOR,
+    SensorSubtype.PANEL_MOTION_SENSOR,
 }
 
 
-def _partition_state_to_wire(state: Partition.DeviceState | None) -> str:
-    if state == Partition.DeviceState.DISARMED:
+def _partition_state_to_wire(state: PartitionState | None) -> str:
+    if state == PartitionState.DISARMED:
         return "disarmed"
-    if state == Partition.DeviceState.ARMED_STAY:
+    if state == PartitionState.ARMED_STAY:
         return "armed_stay"
-    if state == Partition.DeviceState.ARMED_AWAY:
+    if state == PartitionState.ARMED_AWAY:
         return "armed_away"
-    if state == Partition.DeviceState.ARMED_NIGHT:
+    if state == PartitionState.ARMED_NIGHT:
         return "armed_night"
     return "unknown"
 
 
+def _battery_is_low(b: BatteryLevel | None) -> bool | None:
+    if b is None or b == BatteryLevel.NONE:
+        return None
+    return b in (BatteryLevel.CRITICAL, BatteryLevel.LOW)
+
+
 def _partition_to_wire(p: Partition) -> dict:
-    has_open_zones = bool(getattr(p, "uncleared_issues", None))
+    attrs = p.attributes
     return {
         "kind": "panel",
-        "id": str(p.id),  # type: ignore[attr-defined]
-        "name": p.name or f"Panel {p.id}",  # type: ignore[attr-defined]
-        "state": _partition_state_to_wire(p.state),
-        "hasOpenZones": has_open_zones,
+        "id": str(p.id),
+        "name": p.name or f"Panel {p.id}",
+        "state": _partition_state_to_wire(attrs.state),
+        "hasOpenZones": bool(getattr(attrs, "has_open_bypassable_sensors", False)),
     }
 
 
-def _contact_sensor_to_wire(s: Sensor) -> dict:
-    closed = s.state == Sensor.DeviceState.CLOSED
-    out = {
+def _sensor_to_wire_contact(s: Sensor) -> dict:
+    closed = s.attributes.state == SensorState.CLOSED
+    out: dict[str, Any] = {
         "kind": "contact_sensor",
-        "id": str(s.id),  # type: ignore[attr-defined]
-        "name": s.name or f"Contact Sensor {s.id}",  # type: ignore[attr-defined]
+        "id": str(s.id),
+        "name": s.name or f"Contact Sensor {s.id}",
         "closed": closed,
     }
-    if s.battery_low is not None:
-        out["lowBattery"] = bool(s.battery_low)
+    low = _battery_is_low(s.attributes.battery_level_classification)
+    if low is not None:
+        out["lowBattery"] = low
     return out
 
 
-def _motion_sensor_to_wire(s: Sensor) -> dict:
-    motion = s.state == Sensor.DeviceState.ACTIVE
-    out = {
+def _sensor_to_wire_motion(s: Sensor) -> dict:
+    motion = s.attributes.state == SensorState.ACTIVE
+    out: dict[str, Any] = {
         "kind": "motion_sensor",
-        "id": str(s.id),  # type: ignore[attr-defined]
-        "name": s.name or f"Motion Sensor {s.id}",  # type: ignore[attr-defined]
+        "id": str(s.id),
+        "name": s.name or f"Motion Sensor {s.id}",
         "motion": motion,
     }
-    if s.battery_low is not None:
-        out["lowBattery"] = bool(s.battery_low)
+    low = _battery_is_low(s.attributes.battery_level_classification)
+    if low is not None:
+        out["lowBattery"] = low
     return out
 
 
 # ---------------------------------------------------------------------------
-# Daemon state + handlers
+# Daemon
 # ---------------------------------------------------------------------------
 
 
@@ -159,19 +168,15 @@ MethodHandler = Callable[[dict], Awaitable[dict]]
 
 
 class Daemon:
-    """Holds the AlarmController + aiohttp session for the daemon's lifetime."""
-
-    POLL_INTERVAL_S = 30.0  # async_update() cadence while subscribed (0.5.x has no push)
-
     def __init__(self) -> None:
-        self._session: aiohttp.ClientSession | None = None
-        self._controller: AlarmController | None = None
+        self._bridge: AlarmBridge | None = None
         self._expose_panel = True
         self._expose_contacts = True
         self._expose_motion = True
         self._subscribed = False
-        self._poll_task: asyncio.Task | None = None
-        self._known_devices: dict[str, dict] = {}  # device_id → last wire representation
+        self._unsubscribe: Callable[[], None] | None = None
+        self._stop_ws: Callable[[], None] | None = None
+        self._known_devices: dict[str, dict] = {}
         self._handlers: dict[str, MethodHandler] = {
             "login": self._login,
             "enumerate_devices": self._enumerate_devices,
@@ -179,7 +184,7 @@ class Daemon:
             "subscribe_updates": self._subscribe_updates,
         }
 
-    # ----- JSON-RPC dispatch -----
+    # ----- dispatch -----
 
     async def dispatch(self, line: str) -> None:
         try:
@@ -224,19 +229,14 @@ class Daemon:
         if not username or not password:
             raise ValueError("username and password are required")
 
-        # Fresh aiohttp session; controller holds a reference.
-        self._session = aiohttp.ClientSession()
-        self._controller = AlarmController(
-            username=username,
-            password=password,
-            websession=self._session,
-            twofactorcookie=mfa_cookie,
+        self._bridge = AlarmBridge(
+            username=username, password=password, mfa_token=mfa_cookie
         )
 
         try:
-            await self._controller.async_login()
+            await self._bridge.login()
         except OtpRequired as e:
-            await self._cleanup_session()
+            await self._cleanup()
             raise RuntimeError(
                 "2FA is required on this account. Run `python -m pyalarmdotcomajax "
                 "--username ... --password ...` once in the plugin's venv, submit the "
@@ -244,66 +244,92 @@ class Daemon:
                 "`mfaCookie` field of the plugin config."
             ) from e
         except AuthenticationFailed as e:
-            await self._cleanup_session()
+            await self._cleanup()
             raise RuntimeError(f"Alarm.com authentication failed: {e}") from e
-        except (TryAgain, NotAuthorized) as e:
-            await self._cleanup_session()
-            raise RuntimeError(f"Alarm.com login error (retryable): {e}") from e
 
         _emit_log("info", f"logged in as {username}")
         return {"ok": True}
 
-    async def _cleanup_session(self) -> None:
-        if self._controller is not None:
-            # close_websession may or may not be a coroutine depending on upstream version.
-            try:
-                maybe_coro = self._controller.close_websession()
-                if asyncio.iscoroutine(maybe_coro):
-                    await maybe_coro
-            except Exception:
-                pass
-        if self._session is not None and not self._session.closed:
-            await self._session.close()
-        self._controller = None
-        self._session = None
+    async def _cleanup(self) -> None:
+        try:
+            if self._unsubscribe is not None:
+                self._unsubscribe()
+                self._unsubscribe = None
+            if self._stop_ws is not None:
+                maybe = self._stop_ws()
+                if asyncio.iscoroutine(maybe):
+                    await maybe
+                self._stop_ws = None
+        finally:
+            if self._bridge is not None:
+                try:
+                    maybe_close = self._bridge.close()
+                    if asyncio.iscoroutine(maybe_close):
+                        await maybe_close
+                except Exception:
+                    pass
+            self._bridge = None
 
     # ----- enumerate -----
 
     async def _enumerate_devices(self, params: dict) -> dict:
-        self._require_controller()
+        self._require_bridge()
         self._expose_panel = bool(params.get("include_security_panel", True))
         self._expose_contacts = bool(params.get("include_contact_sensors", True))
         self._expose_motion = bool(params.get("include_motion_sensors", True))
 
-        await self._controller.async_update()  # type: ignore[union-attr]
+        # In 0.6, initialize() pulls the full device catalog.
+        await self._bridge.initialize()  # type: ignore[union-attr]
 
         devices = self._snapshot_devices()
-        # Cache initial snapshot so we can detect changes during polling.
         self._known_devices = {d["id"]: d for d in devices}
+        _emit_log(
+            "info",
+            f"discovered {len(devices)} device(s): "
+            f"{sum(1 for d in devices if d['kind'] == 'panel')} panels, "
+            f"{sum(1 for d in devices if d['kind'] == 'contact_sensor')} contacts, "
+            f"{sum(1 for d in devices if d['kind'] == 'motion_sensor')} motions",
+        )
         return {"devices": devices}
 
     def _snapshot_devices(self) -> list[dict]:
-        assert self._controller is not None
+        assert self._bridge is not None
         out: list[dict] = []
 
         if self._expose_panel:
-            for p in self._controller.devices.partitions:
+            for p in self._bridge.partitions:
                 out.append(_partition_to_wire(p))
 
         if self._expose_contacts or self._expose_motion:
-            for s in self._controller.devices.sensors:
-                subtype = getattr(s, "device_subtype", None)
+            for s in self._bridge.sensors:
+                subtype = getattr(s.attributes, "device_type", None)
                 if subtype in CONTACT_SUBTYPES and self._expose_contacts:
-                    out.append(_contact_sensor_to_wire(s))
+                    out.append(_sensor_to_wire_contact(s))
                 elif subtype in MOTION_SUBTYPES and self._expose_motion:
-                    out.append(_motion_sensor_to_wire(s))
+                    out.append(_sensor_to_wire_motion(s))
 
         return out
+
+    def _lookup_wire(self, resource_id: str) -> dict | None:
+        """Find the current wire representation for a resource id, or None if we don't expose it."""
+        assert self._bridge is not None
+        partition = self._bridge.partitions.get(resource_id)
+        if partition is not None and self._expose_panel:
+            return _partition_to_wire(partition)
+
+        sensor = self._bridge.sensors.get(resource_id)
+        if sensor is not None:
+            subtype = getattr(sensor.attributes, "device_type", None)
+            if subtype in CONTACT_SUBTYPES and self._expose_contacts:
+                return _sensor_to_wire_contact(sensor)
+            if subtype in MOTION_SUBTYPES and self._expose_motion:
+                return _sensor_to_wire_motion(sensor)
+        return None
 
     # ----- panel action -----
 
     async def _panel_action(self, params: dict) -> dict:
-        self._require_controller()
+        self._require_bridge()
         device_id = params.get("device_id")
         action = params.get("action")
         bypass = bool(params.get("bypass_zones", False))
@@ -313,107 +339,68 @@ class Daemon:
         if not device_id:
             raise ValueError("device_id is required")
 
-        partition = next(
-            (
-                p
-                for p in self._controller.devices.partitions  # type: ignore[union-attr]
-                if str(p.id) == str(device_id)  # type: ignore[attr-defined]
-            ),
-            None,
-        )
+        partitions = self._bridge.partitions  # type: ignore[union-attr]
+        partition = partitions.get(str(device_id))
         if partition is None:
             raise RuntimeError(f"partition {device_id} not found")
 
         if action == "disarm":
-            await partition.async_disarm()
+            await partitions.disarm(str(device_id))
         elif action == "arm_stay":
-            await partition.async_arm_stay(force_bypass=bypass or None)
+            await partitions.arm_stay(str(device_id), force_bypass=bypass)
         elif action == "arm_away":
-            await partition.async_arm_away(force_bypass=bypass or None)
+            await partitions.arm_away(str(device_id), force_bypass=bypass)
         elif action == "arm_night":
-            if not getattr(partition, "supports_night_arming", False):
-                raise RuntimeError("this partition does not support Night arming")
-            await partition.async_arm_night(force_bypass=bypass or None)
+            await partitions.arm_night(str(device_id), force_bypass=bypass)
 
-        # Push an immediate state refresh so Home.app reflects the change quickly.
-        asyncio.create_task(self._refresh_and_notify())
         return {"ok": True}
 
-    # ----- subscribe -----
+    # ----- subscribe (0.6 event-driven) -----
 
     async def _subscribe_updates(self, _params: dict) -> dict:
-        self._require_controller()
+        self._require_bridge()
         if self._subscribed:
             return {"ok": True}
         self._subscribed = True
 
-        # Register per-device callbacks: every external state change emits a notification.
-        assert self._controller is not None
-        for p in self._controller.devices.partitions:
-            p.register_external_update_callback(
-                lambda *_, _p=p: self._notify_device_change(_partition_to_wire(_p))
-            )
-        for s in self._controller.devices.sensors:
-            subtype = getattr(s, "device_subtype", None)
-            if subtype in CONTACT_SUBTYPES and self._expose_contacts:
-                s.register_external_update_callback(
-                    lambda *_, _s=s: self._notify_device_change(_contact_sensor_to_wire(_s))
-                )
-            elif subtype in MOTION_SUBTYPES and self._expose_motion:
-                s.register_external_update_callback(
-                    lambda *_, _s=s: self._notify_device_change(_motion_sensor_to_wire(_s))
-                )
+        bridge = self._bridge
+        assert bridge is not None
 
-        # Also start a polling loop as a safety net — pyalarmdotcomajax 0.5.x doesn't
-        # stream push events out of the box, so we drive async_update() periodically.
-        # When 0.6 ships stable we'll swap this for start_websocket().
-        self._poll_task = asyncio.create_task(self._poll_loop())
+        # start_event_monitoring returns an optional stop handle; also opens the WS.
+        self._stop_ws = await bridge.start_event_monitoring()
 
-        _emit_log("info", "subscribed to events (polling every 30s)")
+        # EventBroker.subscribe fires our callback for every ResourceEventMessage.
+        # We filter to resource-update events and re-emit as device_updated if known.
+        def on_event(msg: EventBrokerMessage) -> None:
+            topic = getattr(msg, "topic", None)
+            if topic == EventBrokerTopic.RESOURCE_UPDATED:
+                resource_id = getattr(msg, "id", None)
+                if not resource_id:
+                    return
+                wire = self._lookup_wire(str(resource_id))
+                if wire is not None and self._known_devices.get(wire["id"]) != wire:
+                    self._known_devices[wire["id"]] = wire
+                    _emit_notification("device_updated", {"device": wire})
+            elif topic in (EventBrokerTopic.RESOURCE_ADDED, EventBrokerTopic.RESOURCE_DELETED):
+                # Device set changed; re-enumerate and ship the new list.
+                current = {d["id"]: d for d in self._snapshot_devices()}
+                if set(current.keys()) != set(self._known_devices.keys()):
+                    self._known_devices = current
+                    _emit_notification(
+                        "devices_enumerated", {"devices": list(current.values())}
+                    )
+
+        self._unsubscribe = bridge.subscribe(on_event)
+        _emit_log("info", "event subscription live (push events via websocket)")
         return {"ok": True}
 
-    async def _poll_loop(self) -> None:
-        assert self._controller is not None
-        while self._subscribed:
-            await asyncio.sleep(self.POLL_INTERVAL_S)
-            try:
-                await self._refresh_and_notify()
-            except Exception as e:
-                _emit_log("warn", f"poll error: {type(e).__name__}: {e}")
-
-    async def _refresh_and_notify(self) -> None:
-        """Call async_update() and diff against known state; notify on changes."""
-        assert self._controller is not None
-        await self._controller.async_update()
-        current = {d["id"]: d for d in self._snapshot_devices()}
-
-        # Emit notifications only for devices whose wire state actually changed.
-        for device_id, wire in current.items():
-            prev = self._known_devices.get(device_id)
-            if prev != wire:
-                self._notify_device_change(wire)
-
-        # If the device set changed (added/removed), re-send the full enumeration.
-        if set(current.keys()) != set(self._known_devices.keys()):
-            _emit_notification("devices_enumerated", {"devices": list(current.values())})
-
-        self._known_devices = current
-
-    def _notify_device_change(self, wire: dict) -> None:
-        self._known_devices[wire["id"]] = wire
-        _emit_notification("device_updated", {"device": wire})
-
-    def _require_controller(self) -> None:
-        if self._controller is None:
+    def _require_bridge(self) -> None:
+        if self._bridge is None:
             raise RuntimeError("not logged in — call login first")
 
     async def shutdown(self) -> None:
         self._subscribed = False
-        if self._poll_task is not None:
-            self._poll_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self._poll_task
-        await self._cleanup_session()
+        await self._cleanup()
 
 
 # ---------------------------------------------------------------------------
@@ -427,7 +414,7 @@ async def main_async(log_level: str) -> None:
         stream=sys.stderr,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    _emit_log("info", "daemon started")
+    _emit_log("info", "daemon started (pyalarmdotcomajax 0.6.x)")
 
     daemon = Daemon()
     queue = await _stdin_lines()
