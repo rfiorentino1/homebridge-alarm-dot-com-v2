@@ -3,33 +3,26 @@
   "pluginType": "platform",
   "singular": true,
   "headerDisplay": "Event-driven Homebridge plugin for Alarm.com-backed security systems (ADT Control, ADT Command, ADT+, Brinks, and others). Requires Python 3.13+ on your Homebridge host; the plugin auto-installs `pyalarmdotcomajax` in a private venv on first run.",
-  "footerDisplay": "For 2FA setup, first sign in to Alarm.com's web portal and opt for device-based 2FA. The first time this plugin starts, it will prompt for a fresh 2FA code in the Homebridge log.",
+  "footerDisplay": "If your account has 2FA enabled, run `python -m pyalarmdotcomajax` once in the plugin's venv to capture a remember-me cookie, then paste it into the 2FA field in Advanced settings.",
   "schema": {
     "type": "object",
     "properties": {
-      "name": {
-        "title": "Platform Name",
-        "type": "string",
-        "default": "Alarm.com",
-        "required": true
-      },
       "username": {
-        "title": "Alarm.com Username",
+        "title": "Email",
         "type": "string",
         "required": true,
+        "placeholder": "you@example.com",
         "description": "Your Alarm.com (or ADT Control / ADT+) login email."
       },
       "password": {
-        "title": "Alarm.com Password",
+        "title": "Password",
         "type": "string",
         "required": true,
-        "format": "password",
-        "description": "Your Alarm.com account password."
-      },
-      "mfaCookie": {
-        "title": "2FA Remember-Me Cookie (optional)",
-        "type": "string",
-        "description": "If your account has 2FA enabled, paste the remember-me cookie from a successful pyalarmdotcomajax CLI login here. Leave blank if your account does not use 2FA."
+        "placeholder": "Alarm.com password",
+        "description": "Your Alarm.com account password.",
+        "x-schema-form": {
+          "type": "password"
+        }
       },
       "exposeSecurityPanel": {
         "title": "Expose Security Panel",
@@ -48,13 +41,26 @@
         "default": true
       },
       "armAwayKeypadBypass": {
-        "title": "Bypass open zones when arming Away",
+        "title": "Bypass open zones when arming",
         "type": "boolean",
         "default": false,
-        "description": "If enabled, faults are bypassed when Home app requests Arm Away. Leave off for most setups."
+        "description": "When Home.app requests Arm, faulted zones will be bypassed. Leave off for most setups."
+      },
+      "mfaCookie": {
+        "title": "2FA Remember-Me Cookie",
+        "type": "string",
+        "placeholder": "Paste cookie from pyalarmdotcomajax CLI",
+        "description": "Only needed if your account has 2FA enabled. See footer for how to capture.",
+        "x-schema-form": {
+          "type": "password"
+        }
+      },
+      "name": {
+        "type": "string",
+        "default": "Alarm.com"
       },
       "pythonPath": {
-        "title": "Python executable path (advanced)",
+        "title": "Python executable path",
         "type": "string",
         "description": "Override the detected Python 3.13+ binary. Leave blank for auto-detect."
       },
@@ -71,5 +77,47 @@
         ]
       }
     }
-  }
+  },
+  "layout": [
+    {
+      "type": "section",
+      "title": "Alarm.com Credentials",
+      "expandable": false,
+      "expanded": true,
+      "items": [
+        {
+          "description": "Sign in with the same credentials you use for the Alarm.com (or ADT Control / ADT+) app.",
+          "items": ["username", "password"]
+        }
+      ]
+    },
+    {
+      "type": "section",
+      "title": "Devices to Expose",
+      "expandable": true,
+      "expanded": true,
+      "items": [
+        {
+          "items": [
+            "exposeSecurityPanel",
+            "exposeContactSensors",
+            "exposeMotionSensors",
+            "armAwayKeypadBypass"
+          ]
+        }
+      ]
+    },
+    {
+      "type": "section",
+      "title": "Advanced (Optional)",
+      "expandable": true,
+      "expanded": false,
+      "items": [
+        {
+          "description": "These settings are not required for most users.",
+          "items": ["mfaCookie", "pythonPath", "logLevel"]
+        }
+      ]
+    }
+  ]
 }
