@@ -1,0 +1,75 @@
+{
+  "pluginAlias": "AlarmDotComV2",
+  "pluginType": "platform",
+  "singular": true,
+  "headerDisplay": "Event-driven Homebridge plugin for Alarm.com-backed security systems (ADT Control, ADT Command, ADT+, Brinks, and others). Requires Python 3.13+ on your Homebridge host; the plugin auto-installs `pyalarmdotcomajax` in a private venv on first run.",
+  "footerDisplay": "For 2FA setup, first sign in to Alarm.com's web portal and opt for device-based 2FA. The first time this plugin starts, it will prompt for a fresh 2FA code in the Homebridge log.",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "title": "Platform Name",
+        "type": "string",
+        "default": "Alarm.com",
+        "required": true
+      },
+      "username": {
+        "title": "Alarm.com Username",
+        "type": "string",
+        "required": true,
+        "description": "Your Alarm.com (or ADT Control / ADT+) login email."
+      },
+      "password": {
+        "title": "Alarm.com Password",
+        "type": "string",
+        "required": true,
+        "format": "password",
+        "description": "Your Alarm.com account password."
+      },
+      "mfaCookie": {
+        "title": "2FA Remember-Me Cookie (optional)",
+        "type": "string",
+        "description": "If your account has 2FA enabled, paste the remember-me cookie from a successful pyalarmdotcomajax CLI login here. Leave blank if your account does not use 2FA."
+      },
+      "exposeSecurityPanel": {
+        "title": "Expose Security Panel",
+        "type": "boolean",
+        "default": true,
+        "description": "Exposes the alarm panel as a HomeKit Security System accessory."
+      },
+      "exposeContactSensors": {
+        "title": "Expose Contact Sensors (doors/windows)",
+        "type": "boolean",
+        "default": true
+      },
+      "exposeMotionSensors": {
+        "title": "Expose Motion Sensors",
+        "type": "boolean",
+        "default": true
+      },
+      "armAwayKeypadBypass": {
+        "title": "Bypass open zones when arming Away",
+        "type": "boolean",
+        "default": false,
+        "description": "If enabled, faults are bypassed when Home app requests Arm Away. Leave off for most setups."
+      },
+      "pythonPath": {
+        "title": "Python executable path (advanced)",
+        "type": "string",
+        "description": "Override the detected Python 3.13+ binary. Leave blank for auto-detect."
+      },
+      "logLevel": {
+        "title": "Log verbosity",
+        "type": "string",
+        "default": "info",
+        "oneOf": [
+          { "title": "error", "enum": ["error"] },
+          { "title": "warn", "enum": ["warn"] },
+          { "title": "info", "enum": ["info"] },
+          { "title": "debug", "enum": ["debug"] },
+          { "title": "trace", "enum": ["trace"] }
+        ]
+      }
+    }
+  }
+}

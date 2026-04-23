@@ -1,0 +1,60 @@
+{
+  "name": "homebridge-alarm-dot-com-v2",
+  "displayName": "Alarm.com v2",
+  "version": "0.1.0",
+  "description": "Event-driven Homebridge plugin for Alarm.com-backed security systems (ADT Control, ADT Command, ADT+, Brinks, and other Alarm.com-powered platforms). Exposes the security panel, contact sensors, and motion sensors to HomeKit.",
+  "license": "MIT",
+  "author": "Rocco Fiorentino",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rfiorentino1/homebridge-alarm-dot-com-v2.git"
+  },
+  "bugs": {
+    "url": "https://github.com/rfiorentino1/homebridge-alarm-dot-com-v2/issues"
+  },
+  "homepage": "https://github.com/rfiorentino1/homebridge-alarm-dot-com-v2#readme",
+  "keywords": [
+    "homebridge-plugin",
+    "alarm.com",
+    "alarmdotcom",
+    "adt",
+    "adt-control",
+    "adt-command",
+    "adt-plus",
+    "brinks",
+    "security-system",
+    "contact-sensor",
+    "motion-sensor"
+  ],
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch",
+    "lint": "eslint src/**/*.ts",
+    "format": "prettier --write 'src/**/*.ts' '*.json' '*.md'",
+    "prepublishOnly": "npm run lint && npm run build",
+    "dev": "nodemon --watch src --ext ts --exec 'npm run build'"
+  },
+  "engines": {
+    "homebridge": ">=1.8.0 || >=2.0.0-beta.0",
+    "node": ">=18.20.0 || ^20.15.0 || ^22.0.0"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@typescript-eslint/eslint-plugin": "^8.18.0",
+    "@typescript-eslint/parser": "^8.18.0",
+    "eslint": "^9.17.0",
+    "homebridge": "^1.8.5",
+    "nodemon": "^3.1.9",
+    "prettier": "^3.4.2",
+    "typescript": "^5.7.2"
+  },
+  "files": [
+    "dist",
+    "python",
+    "config.schema.json",
+    "README.md",
+    "LICENSE"
+  ]
+}
