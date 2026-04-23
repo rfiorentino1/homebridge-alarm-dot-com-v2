@@ -52,7 +52,9 @@ from pyalarmdotcomajax.models.sensor import (  # type: ignore[import-untyped]
 # ---------------------------------------------------------------------------
 
 
-async def _stdin_lines() -> "asyncio.Queue[str]":
+async def _stdin_lines() -> tuple["asyncio.Queue[str]", asyncio.Task]:
+    """Returns (queue, pump_task). Caller must keep a reference to pump_task — if
+    it's garbage-collected, stdin reads stop and the daemon silently hangs."""
     queue: asyncio.Queue[str] = asyncio.Queue()
     loop = asyncio.get_running_loop()
     reader = asyncio.StreamReader()
@@ -67,8 +69,8 @@ async def _stdin_lines() -> "asyncio.Queue[str]":
                 return
             await queue.put(line.decode("utf-8", errors="replace").rstrip("\n"))
 
-    asyncio.create_task(pump())
-    return queue
+    pump_task = asyncio.create_task(pump(), name="stdin-pump")
+    return queue, pump_task
 
 
 def _write_message(msg: dict) -> None:
@@ -414,10 +416,20 @@ async def main_async(log_level: str) -> None:
         stream=sys.stderr,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # SECURITY: pyalarmdotcomajax's debug logging dumps entire HTTP request bodies,
+    # including the login POST (which contains the password in plaintext). Force its
+    # logger to WARN regardless of what the user sets our plugin's log level to, so a
+    # debug flag never leaks credentials to the Homebridge log file.
+    logging.getLogger("pyalarmdotcomajax").setLevel(logging.WARNING)
+    logging.getLogger("aiohttp").setLevel(logging.WARNING)
     _emit_log("info", "daemon started (pyalarmdotcomajax 0.6.x)")
 
     daemon = Daemon()
-    queue = await _stdin_lines()
+    queue, pump_task = await _stdin_lines()
+    # Hold a reference to the pump task to prevent it from being GC'd while awaiting
+    # stdin — otherwise the daemon silently stops receiving JSON-RPC requests after
+    # the first handler awaits something.
+    _ = pump_task
 
     loop = asyncio.get_running_loop()
     stop = asyncio.Event()
@@ -425,6 +437,8 @@ async def main_async(log_level: str) -> None:
         with suppress(NotImplementedError):
             loop.add_signal_handler(sig, stop.set)
 
+    # Keep strong references to in-flight dispatch tasks to avoid GC.
+    pending: set[asyncio.Task] = set()
     try:
         while not stop.is_set():
             try:
@@ -435,7 +449,9 @@ async def main_async(log_level: str) -> None:
                 break
             if not line.strip():
                 continue
-            asyncio.create_task(daemon.dispatch(line))
+            task = asyncio.create_task(daemon.dispatch(line))
+            pending.add(task)
+            task.add_done_callback(pending.discard)
     finally:
         await daemon.shutdown()
         _emit_log("info", "daemon shutting down")
