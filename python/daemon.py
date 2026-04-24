@@ -133,18 +133,25 @@ def _partition_to_wire(p: Partition) -> dict:
     }
 
 
-def _sensor_is_open(state: SensorState) -> bool:
-    """HA's alarmdotcom integration treats state.value % 2 == 0 as IS_ON.
-    Applied to contact sensors this means: OPEN (2) is open; CLOSED (1) and
-    OPENED_CLOSED (9, a momentary-cycle that settles in the closed position)
-    are both closed. UNKNOWN (0) conservatively treated as open so the user
-    knows something's wrong rather than a false sense of security.
+def _sensor_to_wire_contact(s: Sensor, *, pending_close: bool = False) -> dict:
+    """Map a Sensor to our HomeKit wire representation.
+
+    `pending_close` forces `closed: False` (open) regardless of reported
+    state. Used by the OPENED_CLOSED "stay open until reconcile confirms
+    closed" handler so automations watching for an open transition fire
+    reliably, even for brief cycles that Alarm.com collapses into a single
+    OPENED_CLOSED event.
     """
-    return (state.value % 2) == 0
-
-
-def _sensor_to_wire_contact(s: Sensor) -> dict:
-    closed = not _sensor_is_open(s.attributes.state)
+    if pending_close:
+        closed = False
+    else:
+        # CLOSED (1) = stable-closed; OPEN (2) = stable-open.
+        # OPENED_CLOSED (9) normally means 'settled closed after brief cycle'
+        # — but when we receive the event we force-open (via pending_close
+        # flag, handled upstream); after the next reconcile, we fall through
+        # here and it gets treated as closed, confirming the cycle is done.
+        state = s.attributes.state
+        closed = state == SensorState.CLOSED or state == SensorState.OPENED_CLOSED
     out: dict[str, Any] = {
         "kind": "contact_sensor",
         "id": str(s.id),
@@ -431,6 +438,32 @@ class Daemon:
                 # what comes through for most ADT-branded sensors in practice.
                 if not resource_id:
                     return
+
+                # Special handling for OPENED_CLOSED: Alarm.com emits this as a
+                # single event when a sensor cycled too fast for separate
+                # OPEN/CLOSED events. We force-emit OPEN immediately (so
+                # automations watching for 'door opened' fire). The next
+                # reconcile (<=10s) will see state still at OPENED_CLOSED and
+                # treat it as closed, settling HomeKit to closed.
+                if self._bridge is not None:
+                    sensor = self._bridge.sensors.get(str(resource_id))
+                    if (
+                        sensor is not None
+                        and sensor.attributes.state == SensorState.OPENED_CLOSED
+                        and sensor.attributes.device_type in CONTACT_SUBTYPES
+                        and self._expose_contacts
+                    ):
+                        open_wire = _sensor_to_wire_contact(sensor, pending_close=True)
+                        if self._known_devices.get(open_wire["id"]) != open_wire:
+                            self._known_devices[open_wire["id"]] = open_wire
+                            _emit_notification("device_updated", {"device": open_wire})
+                            _emit_log(
+                                "info",
+                                f"force-open on OPENED_CLOSED: {open_wire['name']} "
+                                f"(reconcile will settle to closed)",
+                            )
+                        return
+
                 wire = self._lookup_wire(str(resource_id))
                 if wire is None:
                     _emit_log("info", f"event: no wire for id={resource_id} (not exposed)")
