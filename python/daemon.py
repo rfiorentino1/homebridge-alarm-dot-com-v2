@@ -168,6 +168,12 @@ def _sensor_to_wire_motion(s: Sensor) -> dict:
 
 MethodHandler = Callable[[dict], Awaitable[dict]]
 
+# Periodic full-state reconciliation interval. Websocket events are the primary
+# signal, but occasionally get dropped or the connection has a hiccup during which
+# changes are missed; this poll catches any drift so the HomeKit view always
+# matches reality within this window.
+RECONCILE_INTERVAL_S = 30.0
+
 
 class Daemon:
     def __init__(self) -> None:
@@ -178,6 +184,7 @@ class Daemon:
         self._subscribed = False
         self._unsubscribe: Callable[[], None] | None = None
         self._stop_ws: Callable[[], None] | None = None
+        self._reconcile_task: asyncio.Task | None = None
         self._known_devices: dict[str, dict] = {}
         self._handlers: dict[str, MethodHandler] = {
             "login": self._login,
@@ -254,6 +261,11 @@ class Daemon:
 
     async def _cleanup(self) -> None:
         try:
+            if self._reconcile_task is not None:
+                self._reconcile_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await self._reconcile_task
+                self._reconcile_task = None
             if self._unsubscribe is not None:
                 self._unsubscribe()
                 self._unsubscribe = None
@@ -393,8 +405,52 @@ class Daemon:
                     )
 
         self._unsubscribe = bridge.subscribe(on_event)
-        _emit_log("info", "event subscription live (push events via websocket)")
+
+        # Start a background reconciliation loop as a safety net for missed websocket
+        # events. Runs forever while subscribed; on cancel it exits cleanly.
+        self._reconcile_task = asyncio.create_task(self._reconcile_loop())
+
+        _emit_log(
+            "info",
+            f"event subscription live (push via websocket; full reconcile every {int(RECONCILE_INTERVAL_S)}s)",
+        )
         return {"ok": True}
+
+    async def _reconcile_loop(self) -> None:
+        """Periodically reload full device state and emit notifications for any drift.
+
+        This catches cases where the websocket dropped an event, the connection
+        blipped, or pyalarmdotcomajax's local registry lagged behind the server.
+        The cost is one HTTP GET per cycle against Alarm.com's API — low frequency,
+        fine to run continuously.
+        """
+        assert self._bridge is not None
+        while self._subscribed:
+            try:
+                await asyncio.sleep(RECONCILE_INTERVAL_S)
+                if not self._subscribed:
+                    break
+                await self._bridge.initialize()
+                current = {d["id"]: d for d in self._snapshot_devices()}
+                # Emit device_updated for any device whose wire repr changed.
+                changes = 0
+                for device_id, wire in current.items():
+                    if self._known_devices.get(device_id) != wire:
+                        self._known_devices[device_id] = wire
+                        _emit_notification("device_updated", {"device": wire})
+                        changes += 1
+                # Emit full enumeration if the set changed.
+                if set(current.keys()) != set(self._known_devices.keys()):
+                    self._known_devices = current
+                    _emit_notification(
+                        "devices_enumerated", {"devices": list(current.values())}
+                    )
+                if changes:
+                    _emit_log("debug", f"reconcile: {changes} device(s) drifted, corrected")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                _emit_log("warn", f"reconcile loop error: {type(e).__name__}: {e}")
 
     def _require_bridge(self) -> None:
         if self._bridge is None:
