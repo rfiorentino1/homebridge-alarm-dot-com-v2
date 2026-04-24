@@ -392,11 +392,17 @@ class Daemon:
         def on_event(msg: EventBrokerMessage) -> None:
             topic = getattr(msg, "topic", None)
             resource_id = getattr(msg, "id", None)
+            resource = getattr(msg, "resource", None)
 
             # Trace-log everything so we can diagnose missed events in the field.
+            # NOTE: Don't call repr() on the resource — some pyalarmdotcomajax
+            # models (e.g. Sensor) have a buggy __repr__ that raises AttributeError
+            # on missing attributes like 'model'. Use type name only.
             topic_name = topic.name if topic is not None else "?"
+            resource_type = type(resource).__name__ if resource is not None else "None"
             _emit_log(
-                "debug", f"event: topic={topic_name} id={resource_id} resource={getattr(msg, 'resource', None)!r}"
+                "debug",
+                f"event: topic={topic_name} id={resource_id} resource_type={resource_type}",
             )
 
             if topic in (
