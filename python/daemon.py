@@ -454,14 +454,25 @@ class Daemon:
                         and self._expose_contacts
                     ):
                         open_wire = _sensor_to_wire_contact(sensor, pending_close=True)
+                        closed_wire = _sensor_to_wire_contact(sensor)
                         if self._known_devices.get(open_wire["id"]) != open_wire:
                             self._known_devices[open_wire["id"]] = open_wire
                             _emit_notification("device_updated", {"device": open_wire})
                             _emit_log(
                                 "info",
                                 f"force-open on OPENED_CLOSED: {open_wire['name']} "
-                                f"(reconcile will settle to closed)",
+                                f"(close will follow in ~3s)",
                             )
+                        # Emit the close 3s later. Alarm.com only sends
+                        # OPENED_CLOSED for brief cycles (typically < 5s),
+                        # so 3s is a reasonable "cycle is done" assumption.
+                        # Automations on door-opened fire immediately; door-
+                        # closed fires with ~3s delay.
+                        task = asyncio.create_task(
+                            self._emit_delayed(closed_wire, 3.0, label="post-cycle-close")
+                        )
+                        self._post_event_tasks.add(task)
+                        task.add_done_callback(self._post_event_tasks.discard)
                         return
 
                 wire = self._lookup_wire(str(resource_id))
