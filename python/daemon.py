@@ -133,8 +133,22 @@ def _partition_to_wire(p: Partition) -> dict:
     }
 
 
-def _sensor_to_wire_contact(s: Sensor) -> dict:
-    closed = s.attributes.state == SensorState.CLOSED
+def _sensor_to_wire_contact(s: Sensor, *, force_open: bool = False) -> dict:
+    """Map a Sensor to our wire representation.
+
+    `force_open` is a flag used by the OPENED_CLOSED "blip" handler — it
+    forces `closed: False` regardless of the sensor's reported state so we
+    can emit a momentary-open transition to HomeKit before the settled
+    closed state that follows.
+    """
+    if force_open:
+        closed = False
+    else:
+        # CLOSED = stable-closed; everything else is reported as open to HomeKit.
+        # Special case: OPENED_CLOSED represents a momentary cycle (e.g. garage
+        # door opened and re-closed) — handled by emit-open-then-close logic
+        # upstream in the event callback. Here we treat it as closed (end-state).
+        closed = s.attributes.state in (SensorState.CLOSED, SensorState.OPENED_CLOSED)
     out: dict[str, Any] = {
         "kind": "contact_sensor",
         "id": str(s.id),
@@ -421,6 +435,36 @@ class Daemon:
                 # what comes through for most ADT-branded sensors in practice.
                 if not resource_id:
                     return
+
+                # Special handling: if this is a Sensor in OPENED_CLOSED state
+                # (momentary cycle — e.g. garage door opened and immediately
+                # re-closed), emit a "blip" — OPEN then CLOSED — so automations
+                # that watch for "opened" fire, while HomeKit's settled state
+                # ends up matching reality (closed).
+                if self._bridge is not None:
+                    sensor = self._bridge.sensors.get(str(resource_id))
+                    if (
+                        sensor is not None
+                        and sensor.attributes.state == SensorState.OPENED_CLOSED
+                        and sensor.attributes.device_type in CONTACT_SUBTYPES
+                        and self._expose_contacts
+                    ):
+                        open_wire = _sensor_to_wire_contact(sensor, force_open=True)
+                        closed_wire = _sensor_to_wire_contact(sensor)
+                        self._known_devices[open_wire["id"]] = open_wire
+                        _emit_notification("device_updated", {"device": open_wire})
+                        _emit_log(
+                            "info",
+                            f"blip-open: {open_wire['name']} (OPENED_CLOSED cycle)",
+                        )
+                        # Schedule the follow-up "closed" emit after a short delay.
+                        task = asyncio.create_task(
+                            self._emit_delayed(closed_wire, 0.5, label="blip-close")
+                        )
+                        self._post_event_tasks.add(task)
+                        task.add_done_callback(self._post_event_tasks.discard)
+                        return
+
                 wire = self._lookup_wire(str(resource_id))
                 if wire is None:
                     _emit_log("info", f"event: no wire for id={resource_id} (not exposed)")
@@ -438,9 +482,8 @@ class Daemon:
                         "info",
                         f"event but no change: {wire.get('name')} remains {wire}",
                     )
-                # pyalarmdotcomajax often drops the follow-up transition (e.g.
-                # "opened" arrives but the matching "closed" a few seconds
-                # later doesn't). Schedule a quick reconcile to catch it.
+                # pyalarmdotcomajax occasionally drops follow-up transitions.
+                # Schedule a quick reconcile to catch anything missed.
                 task = asyncio.create_task(self._post_event_reconcile())
                 self._post_event_tasks.add(task)
                 task.add_done_callback(self._post_event_tasks.discard)
@@ -491,6 +534,19 @@ class Daemon:
                 await self._run_reconcile("post-event")
         except Exception as e:
             _emit_log("warn", f"post-event reconcile error: {type(e).__name__}: {e}")
+
+    async def _emit_delayed(self, wire: dict, delay_s: float, *, label: str = "delayed") -> None:
+        """Emit a device_updated after a small delay. Used by the OPENED_CLOSED
+        blip handler to follow the open event with a closed event."""
+        try:
+            await asyncio.sleep(delay_s)
+            if not self._subscribed:
+                return
+            self._known_devices[wire["id"]] = wire
+            _emit_notification("device_updated", {"device": wire})
+            _emit_log("info", f"{label}: {wire.get('name')} {wire}")
+        except Exception as e:
+            _emit_log("warn", f"delayed emit error: {type(e).__name__}: {e}")
 
     async def _run_reconcile(self, reason: str) -> None:
         """Shared implementation — refresh full state and diff/emit any changes."""
