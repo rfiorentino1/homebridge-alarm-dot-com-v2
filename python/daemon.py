@@ -383,16 +383,34 @@ class Daemon:
         # start_event_monitoring returns an optional stop handle; also opens the WS.
         self._stop_ws = await bridge.start_event_monitoring()
 
-        # EventBroker.subscribe fires our callback for every ResourceEventMessage.
-        # We filter to resource-update events and re-emit as device_updated if known.
+        # EventBroker.subscribe fires our callback for every EventBrokerMessage.
+        # pyalarmdotcomajax exposes 5 topic types; we handle all of them:
+        #   RESOURCE_UPDATED   — resource state changed; emit device_updated if known
+        #   RAW_RESOURCE_EVENT — server pushed a raw event; refresh known resource
+        #   RESOURCE_ADDED/DELETED — device catalog changed; re-enumerate
+        #   CONNECTION_EVENT   — websocket lifecycle; log for diagnostics
         def on_event(msg: EventBrokerMessage) -> None:
             topic = getattr(msg, "topic", None)
-            if topic == EventBrokerTopic.RESOURCE_UPDATED:
-                resource_id = getattr(msg, "id", None)
+            resource_id = getattr(msg, "id", None)
+
+            # Trace-log everything so we can diagnose missed events in the field.
+            topic_name = topic.name if topic is not None else "?"
+            _emit_log(
+                "debug", f"event: topic={topic_name} id={resource_id} resource={getattr(msg, 'resource', None)!r}"
+            )
+
+            if topic in (
+                EventBrokerTopic.RESOURCE_UPDATED,
+                EventBrokerTopic.RAW_RESOURCE_EVENT,
+            ):
+                # Both trigger the same "re-read and diff" flow. RAW_RESOURCE_EVENT is
+                # what comes through for most ADT-branded sensors in practice.
                 if not resource_id:
                     return
                 wire = self._lookup_wire(str(resource_id))
-                if wire is not None and self._known_devices.get(wire["id"]) != wire:
+                if wire is None:
+                    return
+                if self._known_devices.get(wire["id"]) != wire:
                     self._known_devices[wire["id"]] = wire
                     _emit_notification("device_updated", {"device": wire})
             elif topic in (EventBrokerTopic.RESOURCE_ADDED, EventBrokerTopic.RESOURCE_DELETED):
@@ -403,6 +421,8 @@ class Daemon:
                     _emit_notification(
                         "devices_enumerated", {"devices": list(current.values())}
                     )
+            elif topic == EventBrokerTopic.CONNECTION_EVENT:
+                _emit_log("debug", f"websocket state: {getattr(msg, 'resource', None)}")
 
         self._unsubscribe = bridge.subscribe(on_event)
 
