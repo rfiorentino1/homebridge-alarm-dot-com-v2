@@ -25,6 +25,7 @@ import json
 import logging
 import signal
 import sys
+import time
 from contextlib import suppress
 from typing import Any, Awaitable, Callable
 
@@ -205,6 +206,25 @@ POST_EVENT_RECONCILE_DELAY_S = 3.0
 # real state wins.
 SYNTHETIC_CLOSE_DELAY_S = 30.0
 
+# Hard cap on any single bridge HTTP/WS-setup call. Without this, a half-open
+# TCP connection (network path died with no FIN/RST) makes the awaited call
+# block forever — which is what happened on 2026-04-25 when the parents'
+# internet glitched: both the WS read and the periodic reconcile blocked for
+# ~2 hours until manual restart. 25s is generous for healthy calls (typically
+# <2s) but ensures hangs surface as TimeoutError, which the existing exception
+# handlers already catch + retry.
+BRIDGE_CALL_TIMEOUT_S = 25.0
+
+# Liveness watchdog. If no successful reconcile has happened in this many
+# seconds, the daemon assumes the websocket / HTTP path is wedged and force-
+# resubscribes (tear down WS + reopen). Reconcile runs every
+# RECONCILE_INTERVAL_S (10s) when healthy, so 60s of silence = ~6 missed
+# cycles, well past natural jitter. CONNECTION_EVENT heartbeats arrive in
+# bursts every ~5min so are not a tight enough liveness signal — a successful
+# reconcile is.
+LIVENESS_TIMEOUT_S = 60.0
+WATCHDOG_INTERVAL_S = 15.0
+
 
 class Daemon:
     def __init__(self) -> None:
@@ -219,6 +239,14 @@ class Daemon:
         self._unsubscribe: Callable[[], None] | None = None
         self._stop_ws: Callable[[], None] | None = None
         self._reconcile_task: asyncio.Task | None = None
+        self._watchdog_task: asyncio.Task | None = None
+        self._reconnect_lock = asyncio.Lock()
+        # Liveness markers (monotonic seconds). _last_successful_reconcile is
+        # the primary signal the watchdog watches. _last_event is informational
+        # / future-paranoia (long silence = something's off even if reconciles
+        # are passing).
+        self._last_successful_reconcile_at: float = 0.0
+        self._last_event_at: float = 0.0
         self._known_devices: dict[str, dict] = {}
         self._handlers: dict[str, MethodHandler] = {
             "login": self._login,
@@ -295,6 +323,11 @@ class Daemon:
 
     async def _cleanup(self) -> None:
         try:
+            if self._watchdog_task is not None:
+                self._watchdog_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await self._watchdog_task
+                self._watchdog_task = None
             if self._reconcile_task is not None:
                 self._reconcile_task.cancel()
                 with suppress(asyncio.CancelledError):
@@ -326,8 +359,12 @@ class Daemon:
         self._expose_contacts = bool(params.get("include_contact_sensors", True))
         self._expose_motion = bool(params.get("include_motion_sensors", True))
 
-        # In 0.6, initialize() pulls the full device catalog.
-        await self._bridge.initialize()  # type: ignore[union-attr]
+        # In 0.6, initialize() pulls the full device catalog. Timeout-wrapped
+        # so an unstable network at startup doesn't block enumerate forever.
+        await asyncio.wait_for(
+            self._bridge.initialize(),  # type: ignore[union-attr]
+            timeout=BRIDGE_CALL_TIMEOUT_S,
+        )
 
         devices = self._snapshot_devices()
         self._known_devices = {d["id"]: d for d in devices}
@@ -409,13 +446,33 @@ class Daemon:
         self._require_bridge()
         if self._subscribed:
             return {"ok": True}
-        self._subscribed = True
+        await self._start_subscription_inner()
+        # Watchdog runs for the lifetime of the daemon; only created once.
+        if self._watchdog_task is None:
+            self._watchdog_task = asyncio.create_task(self._watchdog_loop())
+        return {"ok": True}
 
+    async def _start_subscription_inner(self) -> None:
+        """Open the WS subscription and start the reconcile loop. Caller should
+        ensure prior subscription is torn down via _stop_subscription_inner first.
+
+        Wraps bridge.start_event_monitoring() in a timeout so a wedged TCP
+        connect during reconnect can't itself hang the watchdog.
+        """
         bridge = self._bridge
         assert bridge is not None
 
+        self._subscribed = True
+        # Seed liveness so the watchdog gives the WS a fair chance to deliver
+        # its first reconcile before considering the connection stale.
+        self._last_successful_reconcile_at = time.monotonic()
+        self._last_event_at = time.monotonic()
+
         # start_event_monitoring returns an optional stop handle; also opens the WS.
-        self._stop_ws = await bridge.start_event_monitoring()
+        self._stop_ws = await asyncio.wait_for(
+            bridge.start_event_monitoring(),
+            timeout=BRIDGE_CALL_TIMEOUT_S,
+        )
 
         # EventBroker.subscribe fires our callback for every EventBrokerMessage.
         # pyalarmdotcomajax exposes 5 topic types; we handle all of them:
@@ -424,6 +481,7 @@ class Daemon:
         #   RESOURCE_ADDED/DELETED — device catalog changed; re-enumerate
         #   CONNECTION_EVENT   — websocket lifecycle; log for diagnostics
         def on_event(msg: EventBrokerMessage) -> None:
+            self._last_event_at = time.monotonic()
             topic = getattr(msg, "topic", None)
             resource_id = getattr(msg, "id", None)
             resource = getattr(msg, "resource", None)
@@ -593,7 +651,81 @@ class Daemon:
             "info",
             f"event subscription live (push via websocket; full reconcile every {int(RECONCILE_INTERVAL_S)}s)",
         )
-        return {"ok": True}
+
+    async def _stop_subscription_inner(self) -> None:
+        """Tear down the WS subscription + reconcile task without touching the
+        bridge auth state or watchdog. Counterpart to _start_subscription_inner."""
+        self._subscribed = False
+        if self._reconcile_task is not None:
+            self._reconcile_task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await self._reconcile_task
+            self._reconcile_task = None
+        if self._unsubscribe is not None:
+            try:
+                self._unsubscribe()
+            except Exception:
+                pass
+            self._unsubscribe = None
+        if self._stop_ws is not None:
+            try:
+                maybe = self._stop_ws()
+                if asyncio.iscoroutine(maybe):
+                    # Bound the stop call too — it can hang on a wedged socket.
+                    with suppress(asyncio.TimeoutError, Exception):
+                        await asyncio.wait_for(maybe, timeout=BRIDGE_CALL_TIMEOUT_S)
+            except Exception:
+                pass
+            self._stop_ws = None
+
+    async def _force_reconnect(self, reason: str) -> None:
+        """Tear down + rebuild the WS subscription. Lock-protected so concurrent
+        triggers don't race."""
+        if self._reconnect_lock.locked():
+            return
+        async with self._reconnect_lock:
+            _emit_log("warn", f"forcing websocket resubscribe: {reason}")
+            await self._stop_subscription_inner()
+            try:
+                await self._start_subscription_inner()
+                _emit_log("info", "websocket resubscribed cleanly")
+            except Exception as e:
+                # Leave _subscribed = False so the next watchdog tick retries.
+                # Bridge auth state is preserved, so we don't need a full
+                # re-login — just another _start_subscription_inner attempt.
+                _emit_log(
+                    "warn",
+                    f"resubscribe failed: {type(e).__name__}: {e} (will retry)",
+                )
+
+    async def _watchdog_loop(self) -> None:
+        """Liveness watchdog. Fires _force_reconnect when the reconcile loop
+        appears wedged (no successful reconcile within LIVENESS_TIMEOUT_S).
+
+        Uses time-of-last-successful-reconcile rather than time-of-last-event
+        because CONNECTION_EVENT heartbeats from pyalarmdotcomajax arrive in
+        bursts every ~5min — too sparse to use as a tight liveness signal —
+        whereas a healthy reconcile loop runs every RECONCILE_INTERVAL_S.
+        """
+        while True:
+            try:
+                await asyncio.sleep(WATCHDOG_INTERVAL_S)
+                if self._bridge is None:
+                    continue
+                if self._last_successful_reconcile_at == 0.0 and not self._subscribed:
+                    continue
+                age = time.monotonic() - self._last_successful_reconcile_at
+                if age > LIVENESS_TIMEOUT_S:
+                    await self._force_reconnect(
+                        f"no successful reconcile in {age:.0f}s (threshold {int(LIVENESS_TIMEOUT_S)}s)"
+                    )
+                    continue
+                if not self._subscribed:
+                    await self._force_reconnect("subscription state lost")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                _emit_log("warn", f"watchdog error: {type(e).__name__}: {e}")
 
     async def _reconcile_loop(self) -> None:
         """Periodically reload full device state and emit notifications for any drift."""
@@ -633,9 +765,15 @@ class Daemon:
             _emit_log("warn", f"delayed emit error: {type(e).__name__}: {e}")
 
     async def _run_reconcile(self, reason: str) -> None:
-        """Shared implementation — refresh full state and diff/emit any changes."""
+        """Shared implementation — refresh full state and diff/emit any changes.
+
+        Wraps bridge.initialize() in asyncio.wait_for so a hung TCP socket
+        surfaces as TimeoutError instead of blocking the reconcile loop forever.
+        On success, records the timestamp the watchdog uses for liveness.
+        """
         assert self._bridge is not None
-        await self._bridge.initialize()
+        await asyncio.wait_for(self._bridge.initialize(), timeout=BRIDGE_CALL_TIMEOUT_S)
+        self._last_successful_reconcile_at = time.monotonic()
         current = {d["id"]: d for d in self._snapshot_devices()}
         changes = 0
         for device_id, wire in current.items():
