@@ -196,10 +196,22 @@ RECONCILE_INTERVAL_S = 10.0
 # shortly after every event to catch the likely-dropped follow-up.
 POST_EVENT_RECONCILE_DELAY_S = 3.0
 
+# When we receive an OPENED_CLOSED merged event (ADC batches rapid open/close
+# into a single event), we force-emit OPEN immediately then schedule a
+# synthetic CLOSE. The door may actually stay open longer than the typical
+# rapid-cycle case, so we wait this many seconds before forcing the close
+# in HomeKit. If a real Closed/device_updated event arrives for the same
+# sensor during this window, we cancel the pending synthetic close so the
+# real state wins.
+SYNTHETIC_CLOSE_DELAY_S = 30.0
+
 
 class Daemon:
     def __init__(self) -> None:
         self._bridge: AlarmBridge | None = None
+        # Per-sensor pending synthetic close tasks (scheduled after OPENED_CLOSED).
+        # Keyed by sensor wire id; cancelled if a real Closed event arrives first.
+        self._pending_synthetic_close: dict[str, asyncio.Task] = {}
         self._expose_panel = True
         self._expose_contacts = True
         self._expose_motion = True
@@ -429,6 +441,41 @@ class Daemon:
                 "info",
                 f"event: topic={topic_name} id={resource_id} resource_type={resource_type}",
             )
+            # --- TIMING DIAGNOSTIC (temporary) ---
+            # Log ADC-server-reported event time vs daemon receipt time so we
+            # can measure cloud→daemon latency per event.
+            try:
+                _emit_log("info", f"timing-diag-fired: topic={topic_name} id={resource_id}")
+                from datetime import datetime, timezone as _tz
+                ws = getattr(self._bridge, "ws_controller", None) if self._bridge is not None else None
+                events = list(ws.last_events) if ws is not None else []
+                # Find the most recent ws event matching this resource id, if any.
+                matched = None
+                for m in reversed(events):
+                    mid = getattr(m, "id", None) or (m.get("id") if isinstance(m, dict) else None)
+                    if mid and str(mid) == str(resource_id):
+                        matched = m
+                        break
+                if matched is None and events:
+                    matched = events[-1]
+                edt = getattr(matched, "event_date_utc", None)
+                if edt is None and isinstance(matched, dict):
+                    edt = matched.get("event_date_utc")
+                now = datetime.now(_tz.utc)
+                if edt is not None:
+                    try:
+                        delta = (now - edt).total_seconds()
+                    except Exception:
+                        delta = None
+                    _emit_log(
+                        "info",
+                        f"timing: adc_event_utc={edt} daemon_recv_utc={now.isoformat()} delta_s={delta}",
+                    )
+                else:
+                    _emit_log("info", f"timing: NO event_date_utc, events={len(events)}, last_type={type(events[-1]).__name__ if events else None}, last_raw={str(events[-1])[:500] if events else None}")
+            except Exception as _te:
+                _emit_log("warn", f"timing diag error: {type(_te).__name__}: {_te}")
+            # --- END DIAGNOSTIC ---
 
             if topic in (
                 EventBrokerTopic.RESOURCE_UPDATED,
@@ -463,25 +510,52 @@ class Daemon:
                                 f"force-open on OPENED_CLOSED: {open_wire['name']} "
                                 f"(close will follow in ~3s)",
                             )
-                        # Emit the close 3s later. Alarm.com only sends
-                        # OPENED_CLOSED for brief cycles (typically < 5s),
-                        # so 3s is a reasonable "cycle is done" assumption.
-                        # Automations on door-opened fire immediately; door-
-                        # closed fires with ~3s delay.
+                        # Schedule a synthetic CLOSE event SYNTHETIC_CLOSE_DELAY_S
+                        # seconds after the force-open. If a real Closed state
+                        # transition arrives before then (via RESOURCE_UPDATED
+                        # -> device_updated path), we cancel this synthetic one.
+                        # If no real close arrives, we fall through to the
+                        # synthetic close so the door doesnt appear stuck-open
+                        # in HomeKit forever for merged cycles.
+                        wire_id = closed_wire["id"]
+                        # Cancel any existing pending synthetic close for this
+                        # sensor (rapid re-triggers).
+                        prev = self._pending_synthetic_close.pop(wire_id, None)
+                        if prev is not None and not prev.done():
+                            prev.cancel()
                         task = asyncio.create_task(
-                            self._emit_delayed(closed_wire, 3.0, label="post-cycle-close")
+                            self._emit_delayed(
+                                closed_wire,
+                                SYNTHETIC_CLOSE_DELAY_S,
+                                label=f"post-cycle-close (synthetic, {int(SYNTHETIC_CLOSE_DELAY_S)}s)",
+                            )
                         )
+                        self._pending_synthetic_close[wire_id] = task
                         self._post_event_tasks.add(task)
-                        task.add_done_callback(self._post_event_tasks.discard)
+                        def _clear(t: asyncio.Task, wid: str = wire_id) -> None:
+                            self._post_event_tasks.discard(t)
+                            if self._pending_synthetic_close.get(wid) is t:
+                                self._pending_synthetic_close.pop(wid, None)
+                        task.add_done_callback(_clear)
                         return
 
                 wire = self._lookup_wire(str(resource_id))
                 if wire is None:
                     _emit_log("info", f"event: no wire for id={resource_id} (not exposed)")
                     return
-                prev = self._known_devices.get(wire["id"])
+                # If a real state-transition event arrives for a sensor that has
+                # a pending synthetic close, cancel the synthetic - reality wins.
+                wid = wire["id"]
+                pending = self._pending_synthetic_close.pop(wid, None)
+                if pending is not None and not pending.done():
+                    pending.cancel()
+                    _emit_log(
+                        "info",
+                        f"synthetic-close cancelled by real event: {wire.get('name')}",
+                    )
+                prev = self._known_devices.get(wid)
                 if prev != wire:
-                    self._known_devices[wire["id"]] = wire
+                    self._known_devices[wid] = wire
                     _emit_notification("device_updated", {"device": wire})
                     _emit_log(
                         "info",
