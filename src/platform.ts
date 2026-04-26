@@ -129,10 +129,19 @@ export class AlarmDotComV2Platform implements DynamicPlatformPlugin {
       throw new Error('venvPython/daemonScript not initialized — start() must run first');
     }
 
+    const daemonArgs = ['--log-level', this.pluginConfig.logLevel ?? 'info'];
+    if (this.pluginConfig.debugRpc) {
+      daemonArgs.push('--enable-debug-rpc');
+      this.log.warn(
+        '[platform] debugRpc enabled — daemon will install SIGUSR1 handler that forces a ' +
+          'stall to test the watchdog. Disable in steady-state.',
+      );
+    }
+
     this.bridge = new PythonBridge(
       this.venvPython,
       this.daemonScript,
-      ['--log-level', this.pluginConfig.logLevel ?? 'info'],
+      daemonArgs,
       this.log,
     );
 

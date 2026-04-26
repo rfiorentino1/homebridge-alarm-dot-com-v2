@@ -853,7 +853,32 @@ class Daemon:
 # ---------------------------------------------------------------------------
 
 
-async def main_async(log_level: str) -> None:
+def _debug_force_stall_handler() -> None:
+    """SIGUSR1 handler that blocks the asyncio main thread with a synchronous
+    sleep, simulating the failure mode the OS-thread stall watchdog is designed
+    to catch (a half-open WS scenario where pyalarmdotcomajax's WS recv path
+    makes a sync-blocking call). After ~60s of no asyncio heartbeat updates,
+    the stall thread should fire os._exit(1) and the Node side should respawn.
+
+    Only installed when --enable-debug-rpc is passed. Trigger from the Pi:
+        sudo kill -USR1 $(pgrep -f alarm-dot-com.*daemon.py)
+    """
+    _emit_log(
+        "warn",
+        "DEBUG: SIGUSR1 received — blocking asyncio main thread for 120s to force a wedge "
+        "(stall thread should fire os._exit within STALL_THRESHOLD_S after heartbeat goes stale)",
+    )
+    sys.stderr.write("DEBUG: forcing asyncio stall via time.sleep(120) on main thread\n")
+    sys.stderr.flush()
+    time.sleep(120)
+    # Reaching this line means the stall thread did NOT fire — that's a bug.
+    _emit_log(
+        "error",
+        "DEBUG: time.sleep(120) returned — stall thread DID NOT fire as expected (bug in stall watchdog)",
+    )
+
+
+async def main_async(log_level: str, enable_debug_rpc: bool) -> None:
     logging.basicConfig(
         level=log_level.upper(),
         stream=sys.stderr,
@@ -893,6 +918,14 @@ async def main_async(log_level: str) -> None:
         with suppress(NotImplementedError):
             loop.add_signal_handler(sig, stop.set)
 
+    if enable_debug_rpc:
+        with suppress(NotImplementedError):
+            loop.add_signal_handler(signal.SIGUSR1, _debug_force_stall_handler)
+        _emit_log(
+            "info",
+            "debug-rpc enabled: SIGUSR1 will trigger a forced asyncio stall (test the stall watchdog)",
+        )
+
     # Keep strong references to in-flight dispatch tasks to avoid GC.
     pending: set[asyncio.Task] = set()
     try:
@@ -916,9 +949,16 @@ async def main_async(log_level: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--log-level", default="info")
+    parser.add_argument(
+        "--enable-debug-rpc",
+        action="store_true",
+        help="Enable debug signal handlers for testing the stall watchdog "
+        "(SIGUSR1 forces an asyncio loop wedge). Off by default — only "
+        "enable transiently for testing, never in steady-state.",
+    )
     args = parser.parse_args()
     try:
-        asyncio.run(main_async(args.log_level))
+        asyncio.run(main_async(args.log_level, args.enable_debug_rpc))
     except KeyboardInterrupt:
         pass
 

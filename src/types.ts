@@ -14,6 +14,14 @@ export interface PluginConfig {
   armAwayKeypadBypass?: boolean;
   pythonPath?: string;
   logLevel?: 'error' | 'warn' | 'info' | 'debug' | 'trace';
+  /**
+   * Enable debug signal handlers for testing the stall watchdog. When true,
+   * the daemon installs a SIGUSR1 handler that synchronously blocks the
+   * asyncio main thread for 120s — simulating an asyncio loop wedge so the
+   * OS-thread stall watchdog can be verified end-to-end. Off by default;
+   * enable transiently for testing, never in steady-state.
+   */
+  debugRpc?: boolean;
 }
 
 /** Top-level device categories the plugin exposes. Keep in sync with daemon.py. */
