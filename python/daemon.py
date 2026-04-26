@@ -23,8 +23,10 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import signal
 import sys
+import threading
 import time
 from contextlib import suppress
 from typing import Any, Awaitable, Callable
@@ -225,6 +227,17 @@ BRIDGE_CALL_TIMEOUT_S = 25.0
 LIVENESS_TIMEOUT_S = 60.0
 WATCHDOG_INTERVAL_S = 15.0
 
+# OS-level stall watchdog. Runs in a real OS thread so it stays alive even
+# when the asyncio event loop is wedged (e.g. by a synchronous-blocking call
+# deep in pyalarmdotcomajax during a half-open WS scenario). The async
+# watchdog above only catches reconcile drift; this catches the case where
+# asyncio itself stops ticking. If the heartbeat (updated every 5s by an
+# async task) is stale by more than STALL_THRESHOLD_S, the thread calls
+# os._exit(1) and the Node-side python-bridge re-spawns us fresh.
+HEARTBEAT_INTERVAL_S = 5.0
+STALL_THRESHOLD_S = 60.0
+STALL_CHECK_INTERVAL_S = 5.0
+
 
 class Daemon:
     def __init__(self) -> None:
@@ -242,11 +255,15 @@ class Daemon:
         self._watchdog_task: asyncio.Task | None = None
         self._reconnect_lock = asyncio.Lock()
         # Liveness markers (monotonic seconds). _last_successful_reconcile is
-        # the primary signal the watchdog watches. _last_event is informational
-        # / future-paranoia (long silence = something's off even if reconciles
-        # are passing).
+        # the primary signal the asyncio watchdog watches. _last_event is
+        # informational / future-paranoia. _heartbeat_at is updated every
+        # HEARTBEAT_INTERVAL_S by an async task and watched by the OS-thread
+        # stall watchdog as proof that the asyncio loop itself is alive.
         self._last_successful_reconcile_at: float = 0.0
         self._last_event_at: float = 0.0
+        self._heartbeat_at: float = time.monotonic()
+        self._heartbeat_task: asyncio.Task | None = None
+        self._stall_thread: threading.Thread | None = None
         self._known_devices: dict[str, dict] = {}
         self._handlers: dict[str, MethodHandler] = {
             "login": self._login,
@@ -698,6 +715,39 @@ class Daemon:
                     f"resubscribe failed: {type(e).__name__}: {e} (will retry)",
                 )
 
+    async def _heartbeat_loop(self) -> None:
+        """Updates _heartbeat_at every HEARTBEAT_INTERVAL_S. Watched by the
+        OS-thread stall watchdog as proof that the asyncio loop is alive.
+
+        This task is intentionally trivial — no I/O, no awaits on bridge state
+        — so it can run even if other tasks are stuck in network calls. If
+        THIS task stops firing, asyncio itself is wedged and the OS thread
+        kills the daemon."""
+        while True:
+            self._heartbeat_at = time.monotonic()
+            await asyncio.sleep(HEARTBEAT_INTERVAL_S)
+
+    def _stall_watchdog_thread(self) -> None:
+        """OS-thread watchdog. Runs outside asyncio so it survives event-loop
+        wedges. If the heartbeat is stale by STALL_THRESHOLD_S, force-exits the
+        process — the Node-side python-bridge re-spawns us fresh. This is the
+        backstop that fires when pyalarmdotcomajax's WS recv blocks the loop
+        synchronously during a half-open TCP scenario (the original 04-25 bug).
+
+        Writes to stderr (not stdout/_emit_log) because the asyncio loop owns
+        stdout's writer and may itself be wedged.
+        """
+        while True:
+            time.sleep(STALL_CHECK_INTERVAL_S)
+            age = time.monotonic() - self._heartbeat_at
+            if age > STALL_THRESHOLD_S:
+                sys.stderr.write(
+                    f"FATAL: asyncio heartbeat stale by {age:.0f}s "
+                    f"(threshold {STALL_THRESHOLD_S:.0f}s), forcing exit for respawn\n"
+                )
+                sys.stderr.flush()
+                os._exit(1)
+
     async def _watchdog_loop(self) -> None:
         """Liveness watchdog. Fires _force_reconnect when the reconcile loop
         appears wedged (no successful reconcile within LIVENESS_TIMEOUT_S).
@@ -818,6 +868,19 @@ async def main_async(log_level: str) -> None:
     _emit_log("info", "daemon started (pyalarmdotcomajax 0.6.x)")
 
     daemon = Daemon()
+
+    # Start the OS-thread stall watchdog and the asyncio heartbeat that feeds
+    # it. Both run for the lifetime of the process. The thread is daemon=True
+    # so it dies with the process on clean exit.
+    daemon._heartbeat_at = time.monotonic()
+    daemon._heartbeat_task = asyncio.create_task(daemon._heartbeat_loop())
+    daemon._stall_thread = threading.Thread(
+        target=daemon._stall_watchdog_thread,
+        name="stall-watchdog",
+        daemon=True,
+    )
+    daemon._stall_thread.start()
+
     queue, pump_task = await _stdin_lines()
     # Hold a reference to the pump task to prevent it from being GC'd while awaiting
     # stdin — otherwise the daemon silently stops receiving JSON-RPC requests after

@@ -55,6 +55,17 @@ export class AlarmDotComV2Platform implements DynamicPlatformPlugin {
 
   private bridge: PythonBridge | null = null;
   private shuttingDown = false;
+  private venvPython: string | null = null;
+  private daemonScript: string | null = null;
+  /**
+   * Recent respawn timestamps (epoch ms). Used to throttle auto-respawn so a
+   * persistent failure (e.g. bad credentials) doesn't spin into a tight loop.
+   * Bounded to RESPAWN_WINDOW_MS — older entries are discarded as we go.
+   */
+  private respawnTimes: number[] = [];
+  private static readonly RESPAWN_WINDOW_MS = 5 * 60 * 1000; // 5 min
+  private static readonly MAX_RESPAWNS_PER_WINDOW = 10;
+  private static readonly RESPAWN_BACKOFF_MS = 2000;
 
   constructor(
     public readonly log: Logger,
@@ -95,50 +106,104 @@ export class AlarmDotComV2Platform implements DynamicPlatformPlugin {
       }
 
       const bootstrap = new Bootstrap(this.api.user.storagePath(), this.log);
-      const venvPython = await bootstrap.ensureReady(this.pluginConfig.pythonPath);
-      this.log.info(`[platform] python venv ready at ${venvPython}`);
+      this.venvPython = await bootstrap.ensureReady(this.pluginConfig.pythonPath);
+      this.log.info(`[platform] python venv ready at ${this.venvPython}`);
+      this.daemonScript = pathJoin(__dirname, '..', 'python', 'daemon.py');
 
-      const daemonScript = pathJoin(__dirname, '..', 'python', 'daemon.py');
-      this.bridge = new PythonBridge(
-        venvPython,
-        daemonScript,
-        ['--log-level', this.pluginConfig.logLevel ?? 'info'],
-        this.log,
-      );
-
-      this.bridge.on('notification', (notif: RpcNotification) => this.onNotification(notif));
-      this.bridge.on('exit', ({ code, signal }: { code: number | null; signal: string | null }) => {
-        if (this.shuttingDown) return;
-        this.log.error(
-          `[platform] daemon exited unexpectedly (code=${code}, signal=${signal}). ` +
-            `Restart Homebridge to recover.`,
-        );
-      });
-
-      this.bridge.start();
-
-      // Blocking login — daemon handles 2FA, session persistence, etc.
-      await this.bridge.call('login', {
-        username: this.pluginConfig.username,
-        password: this.pluginConfig.password,
-        mfaCookie: this.pluginConfig.mfaCookie,
-      });
-      this.log.info('[platform] Alarm.com login successful');
-
-      const enumerated = await this.bridge.call<{ devices: Device[] }>('enumerate_devices', {
-        include_security_panel: this.pluginConfig.exposeSecurityPanel ?? true,
-        include_contact_sensors: this.pluginConfig.exposeContactSensors ?? true,
-        include_motion_sensors: this.pluginConfig.exposeMotionSensors ?? true,
-      });
-      this.syncDevices(enumerated.devices);
-
-      await this.bridge.call('subscribe_updates');
-      this.log.info(
-        `[platform] subscribed to events; ${this.handlers.size} accessor${this.handlers.size === 1 ? 'y' : 'ies'} active`,
-      );
+      await this.spawnAndConnect();
     } catch (err) {
       this.log.error(
         `[platform] startup failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /**
+   * Spawn the daemon, register listeners, and run the login → enumerate →
+   * subscribe sequence. Used for both initial startup and auto-respawn after
+   * an unexpected daemon exit (e.g. when the OS-thread stall watchdog inside
+   * the daemon fires `os._exit(1)` after detecting an asyncio loop wedge).
+   */
+  private async spawnAndConnect(): Promise<void> {
+    if (!this.venvPython || !this.daemonScript) {
+      throw new Error('venvPython/daemonScript not initialized — start() must run first');
+    }
+
+    this.bridge = new PythonBridge(
+      this.venvPython,
+      this.daemonScript,
+      ['--log-level', this.pluginConfig.logLevel ?? 'info'],
+      this.log,
+    );
+
+    this.bridge.on('notification', (notif: RpcNotification) => this.onNotification(notif));
+    this.bridge.on('exit', ({ code, signal }: { code: number | null; signal: string | null }) => {
+      if (this.shuttingDown) return;
+      this.log.warn(
+        `[platform] daemon exited unexpectedly (code=${code}, signal=${signal}); attempting respawn`,
+      );
+      void this.scheduleRespawn();
+    });
+
+    this.bridge.start();
+
+    // Blocking login — daemon handles 2FA, session persistence, etc.
+    await this.bridge.call('login', {
+      username: this.pluginConfig.username,
+      password: this.pluginConfig.password,
+      mfaCookie: this.pluginConfig.mfaCookie,
+    });
+    this.log.info('[platform] Alarm.com login successful');
+
+    const enumerated = await this.bridge.call<{ devices: Device[] }>('enumerate_devices', {
+      include_security_panel: this.pluginConfig.exposeSecurityPanel ?? true,
+      include_contact_sensors: this.pluginConfig.exposeContactSensors ?? true,
+      include_motion_sensors: this.pluginConfig.exposeMotionSensors ?? true,
+    });
+    this.syncDevices(enumerated.devices);
+
+    await this.bridge.call('subscribe_updates');
+    this.log.info(
+      `[platform] subscribed to events; ${this.handlers.size} accessor${this.handlers.size === 1 ? 'y' : 'ies'} active`,
+    );
+  }
+
+  /**
+   * Throttled respawn after unexpected daemon exit. Backs off briefly to let
+   * any transient kernel-level cleanup settle, then re-runs the spawn flow.
+   * Bails out if we've respawned too many times in a short window — typically
+   * a sign of a permanent error (bad credentials, etc.) rather than a
+   * recoverable wedge.
+   */
+  private async scheduleRespawn(): Promise<void> {
+    if (this.shuttingDown) return;
+
+    const now = Date.now();
+    this.respawnTimes = this.respawnTimes.filter(
+      (t) => now - t < AlarmDotComV2Platform.RESPAWN_WINDOW_MS,
+    );
+    if (this.respawnTimes.length >= AlarmDotComV2Platform.MAX_RESPAWNS_PER_WINDOW) {
+      this.log.error(
+        `[platform] daemon respawned ${AlarmDotComV2Platform.MAX_RESPAWNS_PER_WINDOW} times in ` +
+          `${AlarmDotComV2Platform.RESPAWN_WINDOW_MS / 1000}s — likely a permanent failure ` +
+          `(e.g. bad credentials). Giving up; restart Homebridge to retry.`,
+      );
+      return;
+    }
+    this.respawnTimes.push(now);
+
+    await new Promise((resolve) =>
+      setTimeout(resolve, AlarmDotComV2Platform.RESPAWN_BACKOFF_MS),
+    );
+    if (this.shuttingDown) return;
+
+    try {
+      await this.spawnAndConnect();
+      this.log.info('[platform] daemon respawned successfully');
+    } catch (err) {
+      this.log.error(
+        `[platform] respawn failed: ${err instanceof Error ? err.message : String(err)}; ` +
+          `will retry on next exit if any`,
       );
     }
   }
@@ -160,6 +225,17 @@ export class AlarmDotComV2Platform implements DynamicPlatformPlugin {
 
     for (const device of devices) {
       seenIds.add(device.id);
+
+      // Respawn-idempotency: if a handler already exists for this device id
+      // (because we're re-running enumerate after a daemon respawn), reuse
+      // it. The accessory + HomeKit registration are still alive — we just
+      // need to push the latest state through.
+      const alreadyAttached = this.handlers.get(device.id);
+      if (alreadyAttached) {
+        this.applyUpdate(alreadyAttached, device);
+        continue;
+      }
+
       const uuid = this.api.hap.uuid.generate(`${PLUGIN_NAME}::${device.id}`);
       const existing = this.cachedAccessories.find((a) => a.UUID === uuid);
 
