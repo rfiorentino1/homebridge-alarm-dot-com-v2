@@ -37,6 +37,7 @@ from pyalarmdotcomajax import (  # type: ignore[import-untyped]
     EventBrokerMessage,
     EventBrokerTopic,
     OtpRequired,
+    SessionExpired,
 )
 from pyalarmdotcomajax.models.base import BatteryLevel  # type: ignore[import-untyped]
 from pyalarmdotcomajax.models.partition import (  # type: ignore[import-untyped]
@@ -817,12 +818,46 @@ class Daemon:
     async def _run_reconcile(self, reason: str) -> None:
         """Shared implementation — refresh full state and diff/emit any changes.
 
-        Wraps bridge.initialize() in asyncio.wait_for so a hung TCP socket
-        surfaces as TimeoutError instead of blocking the reconcile loop forever.
-        On success, records the timestamp the watchdog uses for liveness.
+        Why we don't call bridge.initialize() here: in pyalarmdotcomajax 0.6,
+        AlarmBridge.initialize() short-circuits on `self._initialized=True`
+        and returns immediately with no I/O. After the first startup call it
+        is a no-op, which makes reconcile silently succeed against stale
+        in-memory state — the watchdog never fires, and a half-open TCP
+        socket goes undetected indefinitely. This bit us on 2026-05-02 when
+        the parents' WAN flapped: the WS went zombie, reconcile kept "passing"
+        without ever touching the network, and HomeKit reported the alarm as
+        disarmed for ~12hrs while it was actually ARMED_STAY.
+
+        The fix has two halves:
+          1. is_logged_in(throw=True) — POSTs to alarm.com's keep-alive URL.
+             A real HTTP roundtrip that surfaces zombie TCP as TimeoutError.
+             On 403 the bridge raises SessionExpired; we re-login transparently
+             since alarm.com invalidates sessions after long network gaps.
+          2. partitions._refresh() / sensors._refresh() — the controllers'
+             private refresh is the only call path that actually re-fetches
+             state from the API. fetch_full_state() and initialize() both
+             short-circuit on per-controller `_initialized=True` flags.
+
+        Both calls are wait_for-bounded so a hang surfaces as TimeoutError →
+        reconcile raises → watchdog sees stale liveness → force_reconnect.
         """
         assert self._bridge is not None
-        await asyncio.wait_for(self._bridge.initialize(), timeout=BRIDGE_CALL_TIMEOUT_S)
+        bridge = self._bridge
+        try:
+            await asyncio.wait_for(
+                bridge.is_logged_in(throw=True), timeout=BRIDGE_CALL_TIMEOUT_S
+            )
+        except SessionExpired:
+            _emit_log(
+                "warn", f"reconcile ({reason}): session expired, re-logging in"
+            )
+            await asyncio.wait_for(bridge.login(), timeout=BRIDGE_CALL_TIMEOUT_S)
+        await asyncio.wait_for(
+            bridge.partitions._refresh(), timeout=BRIDGE_CALL_TIMEOUT_S
+        )
+        await asyncio.wait_for(
+            bridge.sensors._refresh(), timeout=BRIDGE_CALL_TIMEOUT_S
+        )
         self._last_successful_reconcile_at = time.monotonic()
         current = {d["id"]: d for d in self._snapshot_devices()}
         changes = 0
