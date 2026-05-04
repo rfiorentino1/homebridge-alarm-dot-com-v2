@@ -137,25 +137,60 @@ def _partition_to_wire(p: Partition) -> dict:
     }
 
 
+def _derive_closed(s: Sensor) -> bool:
+    """Composite source-of-truth for HomeKit closed/open.
+
+    Priority (first match wins):
+      1. `state` == OPEN/CLOSED — pyalarmdotcomajax's WS event handler
+         mutates `state` instantly on Opened (15) / Closed (0) events,
+         so this path delivers snappy push-driven HK transitions.
+      2. `display_state_text` ("Open"/"Closed") — cloud-authoritative
+         human label, the same field the alarm.com web UI and Alexa
+         skill display. Updated by REST refresh (every 10s reconcile).
+         This is the authoritative truth that survives WS event drops.
+      3. `open_closed_status` int (1=Open, 2=Closed) — same authority
+         as `display_state_text`, used as a fallback in case the cloud
+         omits the human label.
+      4. Default closed — sensors are normally closed in steady state,
+         and false-open in HK can trigger automations spuriously.
+
+    Why composite: WS `state` is fast but pyalarmdotcomajax leaves it
+    stuck at OPENED_CLOSED (9) for collapsed cycles and never touches
+    `display_state_text` / `open_closed_status`. Reading both means we
+    get the snappy WS path AND the eventual-consistent REST truth —
+    neither alone is sufficient.
+    """
+    state = s.attributes.state
+    if state == SensorState.OPEN:
+        return False
+    if state == SensorState.CLOSED:
+        return True
+
+    attrs = s.api_resource.attributes
+    text = attrs.get("display_state_text")
+    if text == "Open":
+        return False
+    if text == "Closed":
+        return True
+
+    ocs = attrs.get("open_closed_status")
+    if ocs == 1:
+        return False
+    if ocs == 2:
+        return True
+
+    return True
+
+
 def _sensor_to_wire_contact(s: Sensor, *, pending_close: bool = False) -> dict:
     """Map a Sensor to our HomeKit wire representation.
 
-    `pending_close` forces `closed: False` (open) regardless of reported
-    state. Used by the OPENED_CLOSED "stay open until reconcile confirms
-    closed" handler so automations watching for an open transition fire
-    reliably, even for brief cycles that Alarm.com collapses into a single
-    OPENED_CLOSED event.
+    `pending_close=True` forces `closed: False` regardless of any field —
+    used by the OPENED_CLOSED handler to force a brief OPEN pulse so
+    HomeKit automations watching for an open transition still fire on
+    cycles that ADC collapsed into a single OpenedClosed event.
     """
-    if pending_close:
-        closed = False
-    else:
-        # CLOSED (1) = stable-closed; OPEN (2) = stable-open.
-        # OPENED_CLOSED (9) normally means 'settled closed after brief cycle'
-        # — but when we receive the event we force-open (via pending_close
-        # flag, handled upstream); after the next reconcile, we fall through
-        # here and it gets treated as closed, confirming the cycle is done.
-        state = s.attributes.state
-        closed = state == SensorState.CLOSED or state == SensorState.OPENED_CLOSED
+    closed = False if pending_close else _derive_closed(s)
     out: dict[str, Any] = {
         "kind": "contact_sensor",
         "id": str(s.id),
@@ -200,14 +235,17 @@ RECONCILE_INTERVAL_S = 10.0
 # shortly after every event to catch the likely-dropped follow-up.
 POST_EVENT_RECONCILE_DELAY_S = 3.0
 
-# When we receive an OPENED_CLOSED merged event (ADC batches rapid open/close
-# into a single event), we force-emit OPEN immediately then schedule a
-# synthetic CLOSE. The door may actually stay open longer than the typical
-# rapid-cycle case, so we wait this many seconds before forcing the close
-# in HomeKit. If a real Closed/device_updated event arrives for the same
-# sensor during this window, we cancel the pending synthetic close so the
-# real state wins.
-SYNTHETIC_CLOSE_DELAY_S = 30.0
+# When we receive an OPENED_CLOSED merged event (ADC batches sub-~3s open/close
+# cycles into a single event), we force-emit OPEN immediately then schedule a
+# synthetic CLOSE. 30-day activity-history sample shows OpenedClosed events
+# correspond to genuinely brief cycles (most are <1s magnet disturbances on
+# the garage door); cycles ≥3s emit separate Opened+Closed instead. So a tight
+# pulse is faithful to reality and lets HomeKit automations watching for an
+# open transition still fire. If a real Closed/device_updated event arrives
+# during this window, we cancel the pending synthetic close. At fire time,
+# `_derive_closed` re-checks the cloud-authoritative fields, so a real
+# sustained-open that happens to coincide doesn't get incorrectly closed.
+SYNTHETIC_CLOSE_DELAY_S = 1.5
 
 # Hard cap on any single bridge HTTP/WS-setup call. Without this, a half-open
 # TCP connection (network path died with no FIN/RST) makes the awaited call
