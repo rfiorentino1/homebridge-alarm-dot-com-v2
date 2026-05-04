@@ -266,6 +266,11 @@ class Daemon:
         self._heartbeat_task: asyncio.Task | None = None
         self._stall_thread: threading.Thread | None = None
         self._known_devices: dict[str, dict] = {}
+        # OBSERVATION-ONLY (temporary): per-sensor last-emitted snapshot for
+        # _emit_state_diag's change-detection, plus monotonic timestamp of
+        # last heartbeat emission. Removable with the rest of the diag.
+        self._last_diag_state: dict[str, tuple] = {}
+        self._last_diag_heartbeat_at: float = 0.0
         self._handlers: dict[str, MethodHandler] = {
             "login": self._login,
             "enumerate_devices": self._enumerate_devices,
@@ -563,9 +568,10 @@ class Daemon:
                     return
 
                 # Observation-only diag: dump three state fields side-by-side
-                # at the moment the WS event arrives.
+                # at the moment the WS event arrives. force=True so we always
+                # emit on a real WS event, regardless of dedup state.
                 self._emit_state_diag(
-                    f"event:{topic_name}", [str(resource_id)]
+                    f"event:{topic_name}", [str(resource_id)], force=True
                 )
 
                 # Special handling for OPENED_CLOSED: Alarm.com emits this as a
@@ -808,7 +814,12 @@ class Daemon:
         except Exception as e:
             _emit_log("warn", f"post-event reconcile error: {type(e).__name__}: {e}")
 
-    def _emit_state_diag(self, reason: str, sensor_ids: list[str] | None = None) -> None:
+    def _emit_state_diag(
+        self,
+        reason: str,
+        sensor_ids: list[str] | None = None,
+        force: bool = False,
+    ) -> None:
         """OBSERVATION-ONLY (temporary): dump each sensor's three state-related
         fields together as a JSON log line so we can verify which is the
         cloud's authoritative open/closed signal:
@@ -818,9 +829,15 @@ class Daemon:
           - open_closed_status : cloud-authoritative int, not mutated by WS
           - display_state_text : cloud-authoritative human label
 
-        Called on every reconcile (all sensors) and on every WS event
-        (the affected sensor only). Removable once the encoding is
-        confirmed and we switch source-of-truth.
+        Called on every reconcile (all sensors, force=False) and on every
+        WS sensor event (affected sensor only, force=True). When force is
+        False, only emits when the snapshot differs from the previous
+        emission for that sensor — keeps log volume near-zero in steady
+        state. WS events always emit unconditionally because they're the
+        rare, important moment we don't want to dedup away.
+
+        First call after restart sees an empty `_last_diag_state` dict,
+        so every sensor emits once as a fresh baseline.
         """
         bridge = self._bridge
         if bridge is None:
@@ -836,15 +853,25 @@ class Daemon:
                 if sensor_ids is not None and str(s.id) not in sensor_ids:
                     continue
                 attrs = s.api_resource.attributes
+                snapshot = (
+                    attrs.get("state"),
+                    attrs.get("open_closed_status"),
+                    attrs.get("display_state_text"),
+                    attrs.get("is_bypassed"),
+                )
+                sid = str(s.id)
+                if not force and self._last_diag_state.get(sid) == snapshot:
+                    continue
+                self._last_diag_state[sid] = snapshot
                 payload = {
                     "ts": ts,
                     "source": reason,
-                    "id": str(s.id),
+                    "id": sid,
                     "name": s.name,
-                    "state_int": attrs.get("state"),
-                    "open_closed_status": attrs.get("open_closed_status"),
-                    "display_state_text": attrs.get("display_state_text"),
-                    "is_bypassed": attrs.get("is_bypassed"),
+                    "state_int": snapshot[0],
+                    "open_closed_status": snapshot[1],
+                    "display_state_text": snapshot[2],
+                    "is_bypassed": snapshot[3],
                 }
                 _emit_log("info", "STATE_DIAG " + json.dumps(payload, default=str))
             except Exception as e:
@@ -852,6 +879,23 @@ class Daemon:
                     "warn",
                     f"state_diag emit failed: {type(e).__name__}: {e}",
                 )
+
+    def _emit_state_diag_heartbeat(self, reason: str) -> None:
+        """OBSERVATION-ONLY (temporary): once per ~5 minutes, emit one line
+        that proves the diag path is still alive even when nothing has
+        changed (so silence in the log can't be confused with a dead
+        diagnostic). Removable with the rest of the diag scaffolding."""
+        from datetime import datetime, timezone as _tz
+        now = time.monotonic()
+        if now - self._last_diag_heartbeat_at < 300.0:
+            return
+        self._last_diag_heartbeat_at = now
+        payload = {
+            "ts": datetime.now(_tz.utc).isoformat(),
+            "reason": reason,
+            "tracked_sensors": len(self._last_diag_state),
+        }
+        _emit_log("info", "STATE_DIAG_HEARTBEAT " + json.dumps(payload, default=str))
 
     async def _emit_delayed(self, wire: dict, delay_s: float, *, label: str = "delayed") -> None:
         """Emit a device_updated after a small delay. Used by the OPENED_CLOSED
@@ -925,10 +969,12 @@ class Daemon:
         if changes:
             _emit_log("info", f"reconcile ({reason}): {changes} device(s) drifted, corrected")
 
-        # Observation-only diag: dump three state fields for every sensor,
-        # tagged with the reconcile reason. Used to verify which field is
-        # the cloud's authoritative open/closed signal.
+        # Observation-only diag: dump three state fields for every sensor
+        # (only if changed since last emission — change-detection keeps
+        # steady-state log volume near zero) plus a periodic heartbeat
+        # so silence in the log can't be confused with a dead diagnostic.
         self._emit_state_diag(f"reconcile:{reason}")
+        self._emit_state_diag_heartbeat(f"reconcile:{reason}")
 
     def _require_bridge(self) -> None:
         if self._bridge is None:
