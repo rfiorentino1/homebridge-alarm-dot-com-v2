@@ -562,6 +562,12 @@ class Daemon:
                 if not resource_id:
                     return
 
+                # Observation-only diag: dump three state fields side-by-side
+                # at the moment the WS event arrives.
+                self._emit_state_diag(
+                    f"event:{topic_name}", [str(resource_id)]
+                )
+
                 # Special handling for OPENED_CLOSED: Alarm.com emits this as a
                 # single event when a sensor cycled too fast for separate
                 # OPEN/CLOSED events. We force-emit OPEN immediately (so
@@ -802,6 +808,51 @@ class Daemon:
         except Exception as e:
             _emit_log("warn", f"post-event reconcile error: {type(e).__name__}: {e}")
 
+    def _emit_state_diag(self, reason: str, sensor_ids: list[str] | None = None) -> None:
+        """OBSERVATION-ONLY (temporary): dump each sensor's three state-related
+        fields together as a JSON log line so we can verify which is the
+        cloud's authoritative open/closed signal:
+
+          - state_int       : event-flavored, mutated by WS handler
+                              (OPENED_CLOSED=9 is the suspect)
+          - open_closed_status : cloud-authoritative int, not mutated by WS
+          - display_state_text : cloud-authoritative human label
+
+        Called on every reconcile (all sensors) and on every WS event
+        (the affected sensor only). Removable once the encoding is
+        confirmed and we switch source-of-truth.
+        """
+        bridge = self._bridge
+        if bridge is None:
+            return
+        from datetime import datetime, timezone as _tz
+        ts = datetime.now(_tz.utc).isoformat()
+        try:
+            sensors_iter = list(bridge.sensors)
+        except Exception:
+            return
+        for s in sensors_iter:
+            try:
+                if sensor_ids is not None and str(s.id) not in sensor_ids:
+                    continue
+                attrs = s.api_resource.attributes
+                payload = {
+                    "ts": ts,
+                    "source": reason,
+                    "id": str(s.id),
+                    "name": s.name,
+                    "state_int": attrs.get("state"),
+                    "open_closed_status": attrs.get("open_closed_status"),
+                    "display_state_text": attrs.get("display_state_text"),
+                    "is_bypassed": attrs.get("is_bypassed"),
+                }
+                _emit_log("info", "STATE_DIAG " + json.dumps(payload, default=str))
+            except Exception as e:
+                _emit_log(
+                    "warn",
+                    f"state_diag emit failed: {type(e).__name__}: {e}",
+                )
+
     async def _emit_delayed(self, wire: dict, delay_s: float, *, label: str = "delayed") -> None:
         """Emit a device_updated after a small delay. Used by the OPENED_CLOSED
         blip handler to follow the open event with a closed event."""
@@ -873,6 +924,11 @@ class Daemon:
             )
         if changes:
             _emit_log("info", f"reconcile ({reason}): {changes} device(s) drifted, corrected")
+
+        # Observation-only diag: dump three state fields for every sensor,
+        # tagged with the reconcile reason. Used to verify which field is
+        # the cloud's authoritative open/closed signal.
+        self._emit_state_diag(f"reconcile:{reason}")
 
     def _require_bridge(self) -> None:
         if self._bridge is None:
