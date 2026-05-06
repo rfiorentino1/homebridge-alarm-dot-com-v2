@@ -1040,11 +1040,13 @@ class Daemon:
              Calling sensors._refresh() or partitions._refresh() directly
              SHORT-CIRCUITS at controllers/base.py:251 because those controllers
              have `_api_data_provider` set to device_catalogs — they're data
-             RECEIVERS, not fetchers. Verified 2026-05-06 via a Slider sustained-
-             open: with the prior code, REST fields stayed stale at "Closed"
-             through 47 minutes of physical Open and ~9 reconcile cycles.
-             Refreshing the catalog is the only path that actually updates
-             `bridge.sensors[].api_resource.attributes`.
+             RECEIVERS, not fetchers. Refreshing the catalog is the only path
+             that actually updates `bridge.sensors[].api_resource.attributes`.
+
+             It also requires repopulating `_target_device_ids` before each
+             call — see the inline workaround comment below for the
+             pyalarmdotcomajax 0.6.x destructive-pop bug we discovered
+             2026-05-06.
 
         The wait_for wrap surfaces a hang as TimeoutError → reconcile raises →
         watchdog sees stale liveness → force_reconnect.
@@ -1060,35 +1062,33 @@ class Daemon:
                 "warn", f"reconcile ({reason}): session expired, re-logging in"
             )
             await asyncio.wait_for(bridge.login(), timeout=BRIDGE_CALL_TIMEOUT_S)
-        # TEMP DEBUG: dump slider's bridge-cached attrs before + after refresh
-        # to pinpoint whether the cache fix actually propagates through reconcile.
-        # Remove once verified.
-        try:
-            _slider = bridge.sensors.get("110898743-5")
-            _before = (
-                None if _slider is None else (
-                    _slider.api_resource.attributes.get("state"),
-                    _slider.api_resource.attributes.get("open_closed_status"),
-                    _slider.api_resource.attributes.get("display_state_text"),
-                )
-            )
-        except Exception as _e:
-            _before = f"err:{_e}"
+        # Workaround for pyalarmdotcomajax 0.6.x bug
+        # (controllers/base.py:_refresh, around line 256):
+        #
+        #     if resource_id or len(self._target_device_ids) == 1:
+        #         ids = resource_id or self._target_device_ids.pop()
+        #
+        # `_target_device_ids.pop()` is destructive. For device_catalogs, the set
+        # always contains exactly one element (the active system id) after
+        # bridge.fetch_full_state() runs at startup. The first call to _refresh
+        # — done by initialize() itself — pops that id and leaves the set empty.
+        # Every subsequent _refresh then short-circuits at the
+        # `_requires_target_ids and not self._target_device_ids` check at line 251.
+        # Result: bridge.sensors[].api_resource.attributes never updates from REST
+        # after startup, no matter how many times we call _refresh.
+        #
+        # Verified on 2026-05-06 with a Slider sustained-open: external REST
+        # showed (state=2, ocs=3, display="Open") while the daemon's bridge cache
+        # was frozen at the startup-time (state=1, ocs=2, display="Closed").
+        #
+        # Repopulate the set before each refresh.
+        dc = bridge.device_catalogs
+        sysid = bridge._available_device_catalogs.active_system_id
+        if sysid and sysid not in dc._target_device_ids:
+            dc._target_device_ids.add(sysid)
         await asyncio.wait_for(
-            bridge.device_catalogs._refresh(), timeout=BRIDGE_CALL_TIMEOUT_S
+            dc._refresh(), timeout=BRIDGE_CALL_TIMEOUT_S
         )
-        try:
-            _slider = bridge.sensors.get("110898743-5")
-            _after = (
-                None if _slider is None else (
-                    _slider.api_resource.attributes.get("state"),
-                    _slider.api_resource.attributes.get("open_closed_status"),
-                    _slider.api_resource.attributes.get("display_state_text"),
-                )
-            )
-        except Exception as _e:
-            _after = f"err:{_e}"
-        _emit_log("info", f"RECONCILE_DEBUG ({reason}) slider before={_before} after={_after}")
         self._last_successful_reconcile_at = time.monotonic()
         current = {d["id"]: d for d in self._snapshot_devices()}
         changes = 0
