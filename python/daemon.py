@@ -1060,9 +1060,35 @@ class Daemon:
                 "warn", f"reconcile ({reason}): session expired, re-logging in"
             )
             await asyncio.wait_for(bridge.login(), timeout=BRIDGE_CALL_TIMEOUT_S)
+        # TEMP DEBUG: dump slider's bridge-cached attrs before + after refresh
+        # to pinpoint whether the cache fix actually propagates through reconcile.
+        # Remove once verified.
+        try:
+            _slider = bridge.sensors.get("110898743-5")
+            _before = (
+                None if _slider is None else (
+                    _slider.api_resource.attributes.get("state"),
+                    _slider.api_resource.attributes.get("open_closed_status"),
+                    _slider.api_resource.attributes.get("display_state_text"),
+                )
+            )
+        except Exception as _e:
+            _before = f"err:{_e}"
         await asyncio.wait_for(
             bridge.device_catalogs._refresh(), timeout=BRIDGE_CALL_TIMEOUT_S
         )
+        try:
+            _slider = bridge.sensors.get("110898743-5")
+            _after = (
+                None if _slider is None else (
+                    _slider.api_resource.attributes.get("state"),
+                    _slider.api_resource.attributes.get("open_closed_status"),
+                    _slider.api_resource.attributes.get("display_state_text"),
+                )
+            )
+        except Exception as _e:
+            _after = f"err:{_e}"
+        _emit_log("info", f"RECONCILE_DEBUG ({reason}) slider before={_before} after={_after}")
         self._last_successful_reconcile_at = time.monotonic()
         current = {d["id"]: d for d in self._snapshot_devices()}
         changes = 0
