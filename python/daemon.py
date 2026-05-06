@@ -173,8 +173,11 @@ def _derive_closed(s: Sensor) -> bool:
     if text == "Closed":
         return True
 
+    # Encoding verified empirically 2026-05-06 from a Great Room Slider sustained
+    # open: openClosedStatus=3 means Open, =2 means Closed. The earlier inferred
+    # mapping (1=Open) from JS-bundle inspection was wrong.
     ocs = attrs.get("open_closed_status")
-    if ocs == 1:
+    if ocs == 3:
         return False
     if ocs == 2:
         return True
@@ -235,17 +238,22 @@ RECONCILE_INTERVAL_S = 10.0
 # shortly after every event to catch the likely-dropped follow-up.
 POST_EVENT_RECONCILE_DELAY_S = 3.0
 
-# When we receive an OPENED_CLOSED merged event (ADC batches sub-~3s open/close
-# cycles into a single event), we force-emit OPEN immediately then schedule a
-# synthetic CLOSE. 30-day activity-history sample shows OpenedClosed events
-# correspond to genuinely brief cycles (most are <1s magnet disturbances on
-# the garage door); cycles ≥3s emit separate Opened+Closed instead. So a tight
-# pulse is faithful to reality and lets HomeKit automations watching for an
-# open transition still fire. If a real Closed/device_updated event arrives
-# during this window, we cancel the pending synthetic close. At fire time,
-# `_derive_closed` re-checks the cloud-authoritative fields, so a real
-# sustained-open that happens to coincide doesn't get incorrectly closed.
-SYNTHETIC_CLOSE_DELAY_S = 1.5
+# When we receive an OPENED_CLOSED merged WS event, ADC's edge has collapsed
+# an Open+Close pair into a single notification with NO duration field. The
+# original "cycles ≥3s emit paired events" claim from the first 30-day analysis
+# turned out to be wrong — a 17-day, 26000-event re-mining on 2026-05-06
+# (correlated with Rocco's recollection of held-for-5/10/20-second testing)
+# showed ADC's collapse window is closer to 15-30 seconds and is non-deterministic.
+# Most garage/front-door entries (10-13s typical dwell) collapse silently.
+#
+# So a fixed-duration synthetic close is wrong: too short and HK shows ~1s for
+# a real 15s open; too long and quick blips appear stuck-open. Instead we force
+# OPEN immediately, then poll the per-sensor REST endpoint every
+# OPENED_CLOSED_POLL_INTERVAL_S until openClosedStatus returns to 2 (Closed)
+# or OPENED_CLOSED_POLL_TIMEOUT_S elapses as safety fallback. Verified
+# 2026-05-06 that REST DOES update during sustained opens (3=Open, 2=Closed).
+OPENED_CLOSED_POLL_INTERVAL_S = 1.5
+OPENED_CLOSED_POLL_TIMEOUT_S = 30.0
 
 # Hard cap on any single bridge HTTP/WS-setup call. Without this, a half-open
 # TCP connection (network path died with no FIN/RST) makes the awaited call
@@ -612,12 +620,13 @@ class Daemon:
                     f"event:{topic_name}", [str(resource_id)], force=True
                 )
 
-                # Special handling for OPENED_CLOSED: Alarm.com emits this as a
-                # single event when a sensor cycled too fast for separate
-                # OPEN/CLOSED events. We force-emit OPEN immediately (so
-                # automations watching for 'door opened' fire). The next
-                # reconcile (<=10s) will see state still at OPENED_CLOSED and
-                # treat it as closed, settling HomeKit to closed.
+                # Special handling for OPENED_CLOSED: ADC collapses an Open+Close
+                # pair into a single WS notification with no duration. We force-
+                # emit OPEN to HomeKit immediately, then start a per-sensor REST
+                # polling task that keeps HK at Open until ADC's REST shows the
+                # sensor returned to Closed (or a safety timeout fires). See
+                # OPENED_CLOSED_POLL_* constants above and `_opened_closed_recover_close`
+                # for the polling logic.
                 if self._bridge is not None:
                     sensor = self._bridge.sensors.get(str(resource_id))
                     if (
@@ -627,34 +636,22 @@ class Daemon:
                         and self._expose_contacts
                     ):
                         open_wire = _sensor_to_wire_contact(sensor, pending_close=True)
-                        closed_wire = _sensor_to_wire_contact(sensor)
                         if self._known_devices.get(open_wire["id"]) != open_wire:
                             self._known_devices[open_wire["id"]] = open_wire
                             _emit_notification("device_updated", {"device": open_wire})
                             _emit_log(
                                 "info",
                                 f"force-open on OPENED_CLOSED: {open_wire['name']} "
-                                f"(close will follow in ~3s)",
+                                f"(REST-poll for close, timeout {int(OPENED_CLOSED_POLL_TIMEOUT_S)}s)",
                             )
-                        # Schedule a synthetic CLOSE event SYNTHETIC_CLOSE_DELAY_S
-                        # seconds after the force-open. If a real Closed state
-                        # transition arrives before then (via RESOURCE_UPDATED
-                        # -> device_updated path), we cancel this synthetic one.
-                        # If no real close arrives, we fall through to the
-                        # synthetic close so the door doesnt appear stuck-open
-                        # in HomeKit forever for merged cycles.
-                        wire_id = closed_wire["id"]
-                        # Cancel any existing pending synthetic close for this
+                        # Cancel any existing pending close-poll task for this
                         # sensor (rapid re-triggers).
+                        wire_id = open_wire["id"]
                         prev = self._pending_synthetic_close.pop(wire_id, None)
                         if prev is not None and not prev.done():
                             prev.cancel()
                         task = asyncio.create_task(
-                            self._emit_delayed(
-                                closed_wire,
-                                SYNTHETIC_CLOSE_DELAY_S,
-                                label=f"post-cycle-close (synthetic, {int(SYNTHETIC_CLOSE_DELAY_S)}s)",
-                            )
+                            self._opened_closed_recover_close(wire_id, open_wire["name"])
                         )
                         self._pending_synthetic_close[wire_id] = task
                         self._post_event_tasks.add(task)
@@ -670,14 +667,15 @@ class Daemon:
                     _emit_log("info", f"event: no wire for id={resource_id} (not exposed)")
                     return
                 # If a real state-transition event arrives for a sensor that has
-                # a pending synthetic close, cancel the synthetic - reality wins.
+                # a pending OPENED_CLOSED close-recovery poll, cancel the poll —
+                # reality wins.
                 wid = wire["id"]
                 pending = self._pending_synthetic_close.pop(wid, None)
                 if pending is not None and not pending.done():
                     pending.cancel()
                     _emit_log(
                         "info",
-                        f"synthetic-close cancelled by real event: {wire.get('name')}",
+                        f"opened_closed-poll cancelled by real event: {wire.get('name')}",
                     )
                 prev = self._known_devices.get(wid)
                 if prev != wire:
@@ -935,18 +933,88 @@ class Daemon:
         }
         _emit_log("info", "STATE_DIAG_HEARTBEAT " + json.dumps(payload, default=str))
 
-    async def _emit_delayed(self, wire: dict, delay_s: float, *, label: str = "delayed") -> None:
-        """Emit a device_updated after a small delay. Used by the OPENED_CLOSED
-        blip handler to follow the open event with a closed event."""
-        try:
-            await asyncio.sleep(delay_s)
-            if not self._subscribed:
-                return
+    async def _opened_closed_recover_close(
+        self, sensor_id: str, sensor_name: str
+    ) -> None:
+        """Poll ADC's per-sensor REST endpoint to recover the true close time
+        for an OPENED_CLOSED collapsed event.
+
+        ADC's WS feed delivers OPENED_CLOSED with no duration, but the REST
+        `openClosedStatus` field DOES update during the open window (verified
+        2026-05-06: 3=Open, 2=Closed). Polling REST every
+        OPENED_CLOSED_POLL_INTERVAL_S lets us emit close to HK when the door
+        actually closes, instead of guessing with a fixed pulse. After
+        OPENED_CLOSED_POLL_TIMEOUT_S we emit a safety close so a stuck-open
+        REST never leaves HK pinned to Open.
+
+        We hit the per-sensor URL directly via `bridge.create_request` rather
+        than reading `bridge.sensors[id].api_resource.attributes`, because
+        the bridge cache is updated by the device_catalogs refresh (every
+        RECONCILE_INTERVAL_S) — too coarse for this loop. A direct GET is
+        cheap and bypasses any internal caching.
+        """
+        bridge = self._bridge
+        if bridge is None:
+            return
+        url = f"https://www.alarm.com/web/api/devices/sensors/{sensor_id}"
+        started = time.monotonic()
+        deadline = started + OPENED_CLOSED_POLL_TIMEOUT_S
+        observed_close = False
+        while time.monotonic() < deadline:
+            try:
+                await asyncio.sleep(OPENED_CLOSED_POLL_INTERVAL_S)
+            except asyncio.CancelledError:
+                raise
+            try:
+                async with bridge.create_request("get", url) as resp:
+                    if resp.status != 200:
+                        continue
+                    body = await resp.text()
+                payload = json.loads(body)
+                attrs = (
+                    payload.get("data", {}).get("attributes", {})
+                    if isinstance(payload, dict)
+                    else {}
+                )
+                ocs = attrs.get("openClosedStatus")
+                text = attrs.get("displayStateText")
+                if ocs == 2 or text == "Closed":
+                    elapsed = time.monotonic() - started
+                    _emit_log(
+                        "info",
+                        f"opened_closed-rest-close: {sensor_name} returned Closed "
+                        f"after {elapsed:.1f}s (openClosedStatus={ocs}, display={text!r})",
+                    )
+                    observed_close = True
+                    break
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                _emit_log(
+                    "warn",
+                    f"opened_closed-poll error for {sensor_name}: {type(e).__name__}: {e}",
+                )
+
+        if not self._subscribed:
+            return
+        if not observed_close:
+            _emit_log(
+                "info",
+                f"opened_closed-rest-timeout: {sensor_name} REST never returned Closed "
+                f"in {OPENED_CLOSED_POLL_TIMEOUT_S:.0f}s; emitting safety close",
+            )
+        sensor = bridge.sensors.get(sensor_id)
+        if sensor is None:
+            return
+        wire = _sensor_to_wire_contact(sensor)
+        # Force closed: the bridge's cached state may still be OPENED_CLOSED, in
+        # which case _derive_closed falls through to the closed default — but we
+        # are explicit here in case anything else changes.
+        wire["closed"] = True
+        if self._known_devices.get(wire["id"]) != wire:
             self._known_devices[wire["id"]] = wire
             _emit_notification("device_updated", {"device": wire})
-            _emit_log("info", f"{label}: {wire.get('name')} {wire}")
-        except Exception as e:
-            _emit_log("warn", f"delayed emit error: {type(e).__name__}: {e}")
+            _emit_log("info", f"opened_closed-emit-close: {wire.get('name')}")
 
     async def _run_reconcile(self, reason: str) -> None:
         """Shared implementation — refresh full state and diff/emit any changes.
@@ -966,13 +1034,20 @@ class Daemon:
              A real HTTP roundtrip that surfaces zombie TCP as TimeoutError.
              On 403 the bridge raises SessionExpired; we re-login transparently
              since alarm.com invalidates sessions after long network gaps.
-          2. partitions._refresh() / sensors._refresh() — the controllers'
-             private refresh is the only call path that actually re-fetches
-             state from the API. fetch_full_state() and initialize() both
-             short-circuit on per-controller `_initialized=True` flags.
+          2. device_catalogs._refresh() — the upstream controller that fetches
+             the full device catalog and fans out included sensors / partitions
+             to their respective controllers via subscribed callbacks.
+             Calling sensors._refresh() or partitions._refresh() directly
+             SHORT-CIRCUITS at controllers/base.py:251 because those controllers
+             have `_api_data_provider` set to device_catalogs — they're data
+             RECEIVERS, not fetchers. Verified 2026-05-06 via a Slider sustained-
+             open: with the prior code, REST fields stayed stale at "Closed"
+             through 47 minutes of physical Open and ~9 reconcile cycles.
+             Refreshing the catalog is the only path that actually updates
+             `bridge.sensors[].api_resource.attributes`.
 
-        Both calls are wait_for-bounded so a hang surfaces as TimeoutError →
-        reconcile raises → watchdog sees stale liveness → force_reconnect.
+        The wait_for wrap surfaces a hang as TimeoutError → reconcile raises →
+        watchdog sees stale liveness → force_reconnect.
         """
         assert self._bridge is not None
         bridge = self._bridge
@@ -986,10 +1061,7 @@ class Daemon:
             )
             await asyncio.wait_for(bridge.login(), timeout=BRIDGE_CALL_TIMEOUT_S)
         await asyncio.wait_for(
-            bridge.partitions._refresh(), timeout=BRIDGE_CALL_TIMEOUT_S
-        )
-        await asyncio.wait_for(
-            bridge.sensors._refresh(), timeout=BRIDGE_CALL_TIMEOUT_S
+            bridge.device_catalogs._refresh(), timeout=BRIDGE_CALL_TIMEOUT_S
         )
         self._last_successful_reconcile_at = time.monotonic()
         current = {d["id"]: d for d in self._snapshot_devices()}
