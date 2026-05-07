@@ -254,6 +254,17 @@ POST_EVENT_RECONCILE_DELAY_S = 3.0
 # 2026-05-06 that REST DOES update during sustained opens (3=Open, 2=Closed).
 OPENED_CLOSED_POLL_INTERVAL_S = 1.5
 OPENED_CLOSED_POLL_TIMEOUT_S = 30.0
+# Minimum hold time after an OPENED_CLOSED before we emit close from REST
+# observation. ADC sometimes sends a separate WS Closed event a few seconds
+# after the OPENED_CLOSED — when that happens, the dispatch handler cancels
+# this polling task and emits close at the real time. If we exit too quickly
+# on REST, we miss that opportunity and HK shows the door closed before reality.
+# Verified 2026-05-06: a Front Door cycle had OPENED_CLOSED at 20:13:44 with
+# REST already showing Closed by 1.6s, then a separate Closed WS event arrived
+# at 20:13:49 (5s later). Holding here lets the WS event win for those cases.
+# Cost: brief magnet-disturbance blips that have no follow-up Closed will show
+# ~5s of Open in HK instead of ~1s. Acceptable trade for transit fidelity.
+OPENED_CLOSED_MIN_HOLD_S = 5.0
 
 # Hard cap on any single bridge HTTP/WS-setup call. Without this, a half-open
 # TCP connection (network path died with no FIN/RST) makes the awaited call
@@ -979,7 +990,13 @@ class Daemon:
                 ocs = attrs.get("openClosedStatus")
                 text = attrs.get("displayStateText")
                 if ocs == 2 or text == "Closed":
+                    # ADC's REST has settled to Closed. Don't emit yet if we
+                    # haven't reached MIN_HOLD — gives a separate WS Closed
+                    # event a chance to arrive (which would cancel this task
+                    # and let the dispatch handler emit at the real close time).
                     elapsed = time.monotonic() - started
+                    if elapsed < OPENED_CLOSED_MIN_HOLD_S:
+                        continue
                     _emit_log(
                         "info",
                         f"opened_closed-rest-close: {sensor_name} returned Closed "
