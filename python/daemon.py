@@ -49,6 +49,12 @@ from pyalarmdotcomajax.models.sensor import (  # type: ignore[import-untyped]
     SensorState,
     SensorSubtype,
 )
+from pyalarmdotcomajax.websocket.client import (  # type: ignore[import-untyped]
+    RawResourceEventMessage,
+)
+from pyalarmdotcomajax.websocket.messages import (  # type: ignore[import-untyped]
+    ResourceEventType,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -328,6 +334,30 @@ class Daemon:
         # last heartbeat emission. Removable with the rest of the diag.
         self._last_diag_state: dict[str, tuple] = {}
         self._last_diag_heartbeat_at: float = 0.0
+        # WS-AUTHORITATIVE STATE CACHE.
+        #
+        # Updated ONLY by genuine RAW_RESOURCE_EVENT pushes from the alarm.com
+        # WebSocket — i.e. messages with a real `subtype` (Disarmed=8,
+        # ArmedStay=9, ArmedAway=10, ArmedNight=113, Opened=15, Closed=0).
+        # These are the only state-change signals alarm.com sends in real time
+        # and they carry an unambiguous identity. Anything else (REST refresh,
+        # internal pyalarmdotcomajax fanout, periodic reconcile) goes through
+        # RESOURCE_UPDATED without a subtype attribution.
+        #
+        # The wire-builder methods below consult this cache before falling
+        # through to `attrs.state`. If a real WS push said the panel is
+        # ARMED_AWAY and a subsequent REST-driven RESOURCE_UPDATED tries to
+        # revert to DISARMED (because alarm.com's REST lags 5–10 minutes
+        # behind WS, OR because of a same-second double-fire we haven't
+        # fully traced), the cached push wins and the revert is suppressed.
+        # Real arm→disarm→arm sequences within seconds work because each
+        # transition is a distinct WS push that updates the cache.
+        #
+        # Cache survives WS reconnects (state didn't actually change just
+        # because the socket blipped). Cleared only on daemon restart.
+        self._authoritative_partition_state: dict[str, PartitionState] = {}
+        self._authoritative_sensor_state: dict[str, SensorState] = {}
+        self._raw_unsubscribe: Callable[[], None] | None = None
         self._handlers: dict[str, MethodHandler] = {
             "login": self._login,
             "enumerate_devices": self._enumerate_devices,
@@ -457,21 +487,58 @@ class Daemon:
         )
         return {"devices": devices}
 
+    def _build_partition_wire(self, p: Partition) -> dict:
+        """Wire-builder for a partition that prefers the WS-authoritative state
+        cache over `attrs.state`. See the cache's docstring in __init__ for why
+        this is necessary."""
+        wire = _partition_to_wire(p)
+        auth = self._authoritative_partition_state.get(str(p.id))
+        if auth is not None:
+            wire["state"] = _partition_state_to_wire(auth)
+        return wire
+
+    def _build_sensor_wire_contact(self, s: Sensor, *, pending_close: bool = False) -> dict:
+        """Wire-builder for a contact sensor that prefers the WS-authoritative
+        state cache over `attrs.state` / REST. `pending_close=True` (used by the
+        OPENED_CLOSED force-open path) bypasses the cache entirely so the REST
+        polling loop in _opened_closed_recover_close can drive the eventual
+        close transition."""
+        if pending_close:
+            return _sensor_to_wire_contact(s, pending_close=True)
+        wire = _sensor_to_wire_contact(s)
+        auth = self._authoritative_sensor_state.get(str(s.id))
+        if auth == SensorState.OPEN:
+            wire["closed"] = False
+        elif auth == SensorState.CLOSED:
+            wire["closed"] = True
+        # Other auth values (OPENED_CLOSED, etc.) don't override — let
+        # _derive_closed's existing fallback chain decide.
+        return wire
+
+    def _build_sensor_wire_motion(self, s: Sensor) -> dict:
+        wire = _sensor_to_wire_motion(s)
+        auth = self._authoritative_sensor_state.get(str(s.id))
+        if auth == SensorState.ACTIVE:
+            wire["motion"] = True
+        elif auth == SensorState.IDLE:
+            wire["motion"] = False
+        return wire
+
     def _snapshot_devices(self) -> list[dict]:
         assert self._bridge is not None
         out: list[dict] = []
 
         if self._expose_panel:
             for p in self._bridge.partitions:
-                out.append(_partition_to_wire(p))
+                out.append(self._build_partition_wire(p))
 
         if self._expose_contacts or self._expose_motion:
             for s in self._bridge.sensors:
                 subtype = getattr(s.attributes, "device_type", None)
                 if subtype in CONTACT_SUBTYPES and self._expose_contacts:
-                    out.append(_sensor_to_wire_contact(s))
+                    out.append(self._build_sensor_wire_contact(s))
                 elif subtype in MOTION_SUBTYPES and self._expose_motion:
-                    out.append(_sensor_to_wire_motion(s))
+                    out.append(self._build_sensor_wire_motion(s))
 
         return out
 
@@ -480,15 +547,15 @@ class Daemon:
         assert self._bridge is not None
         partition = self._bridge.partitions.get(resource_id)
         if partition is not None and self._expose_panel:
-            return _partition_to_wire(partition)
+            return self._build_partition_wire(partition)
 
         sensor = self._bridge.sensors.get(resource_id)
         if sensor is not None:
             subtype = getattr(sensor.attributes, "device_type", None)
             if subtype in CONTACT_SUBTYPES and self._expose_contacts:
-                return _sensor_to_wire_contact(sensor)
+                return self._build_sensor_wire_contact(sensor)
             if subtype in MOTION_SUBTYPES and self._expose_motion:
-                return _sensor_to_wire_motion(sensor)
+                return self._build_sensor_wire_motion(sensor)
         return None
 
     # ----- panel action -----
@@ -646,7 +713,7 @@ class Daemon:
                         and sensor.attributes.device_type in CONTACT_SUBTYPES
                         and self._expose_contacts
                     ):
-                        open_wire = _sensor_to_wire_contact(sensor, pending_close=True)
+                        open_wire = self._build_sensor_wire_contact(sensor, pending_close=True)
                         if self._known_devices.get(open_wire["id"]) != open_wire:
                             self._known_devices[open_wire["id"]] = open_wire
                             _emit_notification("device_updated", {"device": open_wire})
@@ -719,6 +786,94 @@ class Daemon:
 
         self._unsubscribe = bridge.subscribe(on_event)
 
+        # SEPARATE subscription for RAW_RESOURCE_EVENT.
+        #
+        # Why two subscriptions: AlarmBridge.subscribe() (used above) only
+        # registers callbacks for RESOURCE_ADDED/UPDATED/DELETED + CONNECTION_EVENT
+        # — it deliberately does NOT include RAW_RESOURCE_EVENT. But RAW is the
+        # only topic that carries the original WS message with its identifying
+        # `subtype` (Disarmed=8, ArmedAway=10, Opened=15, etc.). RESOURCE_UPDATED
+        # is fired both for genuine pushes AND for REST-driven catalog updates
+        # — same envelope, no way to tell them apart.
+        #
+        # We subscribe to RAW directly so we can populate the authoritative
+        # state cache (see __init__) from real pushes only. The cache is then
+        # consulted by _build_partition_wire / _build_sensor_wire_* to keep
+        # downstream emits truthful even when REST overwrites attrs.state.
+        def on_raw_event(msg: EventBrokerMessage) -> None:
+            if not isinstance(msg, RawResourceEventMessage):
+                return
+            ws_msg = msg.ws_message
+            subtype = getattr(ws_msg, "subtype", None)
+            if not isinstance(subtype, ResourceEventType):
+                return  # PropertyChange/Status messages have no event subtype
+            full_device_id = getattr(ws_msg, "full_device_id", None)
+            if not full_device_id:
+                return
+            rid = str(full_device_id)
+
+            # Partition arm/disarm transitions
+            partition_map = {
+                ResourceEventType.Disarmed: PartitionState.DISARMED,
+                ResourceEventType.ArmedStay: PartitionState.ARMED_STAY,
+                ResourceEventType.ArmedAway: PartitionState.ARMED_AWAY,
+                ResourceEventType.ArmedNight: PartitionState.ARMED_NIGHT,
+            }
+            if subtype in partition_map:
+                self._authoritative_partition_state[rid] = partition_map[subtype]
+                _emit_log(
+                    "info",
+                    f"ws-authoritative: partition {rid} → {partition_map[subtype].name}",
+                )
+                return
+
+            # Sensor transitions. Both motion and contact go through the same
+            # cache — _build_sensor_wire_contact / _motion each pick the
+            # SensorState members they care about (OPEN/CLOSED for contact,
+            # ACTIVE/IDLE for motion). For contact: Opened=15→OPEN, Closed=0→CLOSED.
+            # For motion: Opened=15→ACTIVE, Closed=0→IDLE. We need to know the
+            # subtype to decide. Look up the sensor to see if it's motion.
+            bridge_ = self._bridge
+            if bridge_ is None:
+                return
+            sensor = bridge_.sensors.get(rid)
+            if sensor is None:
+                return
+            device_subtype = getattr(sensor.attributes, "device_type", None)
+            is_motion = device_subtype in MOTION_SUBTYPES
+
+            if subtype == ResourceEventType.Opened:
+                self._authoritative_sensor_state[rid] = (
+                    SensorState.ACTIVE if is_motion else SensorState.OPEN
+                )
+                _emit_log(
+                    "info",
+                    f"ws-authoritative: sensor {rid} → {self._authoritative_sensor_state[rid].name}",
+                )
+            elif subtype in (
+                ResourceEventType.Closed,
+                ResourceEventType.DoorLeftOpenRestoral,
+            ):
+                self._authoritative_sensor_state[rid] = (
+                    SensorState.IDLE if is_motion else SensorState.CLOSED
+                )
+                _emit_log(
+                    "info",
+                    f"ws-authoritative: sensor {rid} → {self._authoritative_sensor_state[rid].name}",
+                )
+            # OpenedClosed deliberately not cached — the existing
+            # _opened_closed_recover_close path handles that case via REST polling.
+
+        try:
+            self._raw_unsubscribe = bridge.events.subscribe(
+                EventBrokerTopic.RAW_RESOURCE_EVENT, on_raw_event
+            )
+        except Exception as e:
+            _emit_log(
+                "warn",
+                f"failed to subscribe to RAW_RESOURCE_EVENT: {type(e).__name__}: {e}",
+            )
+
         # Start a background reconciliation loop as a safety net for missed websocket
         # events. Runs forever while subscribed; on cancel it exits cleanly.
         self._reconcile_task = asyncio.create_task(self._reconcile_loop())
@@ -744,6 +899,12 @@ class Daemon:
             except Exception:
                 pass
             self._unsubscribe = None
+        if self._raw_unsubscribe is not None:
+            try:
+                self._raw_unsubscribe()
+            except Exception:
+                pass
+            self._raw_unsubscribe = None
         if self._stop_ws is not None:
             try:
                 maybe = self._stop_ws()
@@ -1023,7 +1184,7 @@ class Daemon:
         sensor = bridge.sensors.get(sensor_id)
         if sensor is None:
             return
-        wire = _sensor_to_wire_contact(sensor)
+        wire = self._build_sensor_wire_contact(sensor)
         # Force closed: the bridge's cached state may still be OPENED_CLOSED, in
         # which case _derive_closed falls through to the closed default — but we
         # are explicit here in case anything else changes.
