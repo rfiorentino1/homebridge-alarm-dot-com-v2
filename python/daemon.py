@@ -329,11 +329,6 @@ class Daemon:
         self._heartbeat_task: asyncio.Task | None = None
         self._stall_thread: threading.Thread | None = None
         self._known_devices: dict[str, dict] = {}
-        # OBSERVATION-ONLY (temporary): per-sensor last-emitted snapshot for
-        # _emit_state_diag's change-detection, plus monotonic timestamp of
-        # last heartbeat emission. Removable with the rest of the diag.
-        self._last_diag_state: dict[str, tuple] = {}
-        self._last_diag_heartbeat_at: float = 0.0
         # WS-AUTHORITATIVE STATE CACHE.
         #
         # Updated ONLY by genuine RAW_RESOURCE_EVENT pushes from the alarm.com
@@ -639,48 +634,10 @@ class Daemon:
             # on missing attributes like 'model'. Use type name only.
             topic_name = topic.name if topic is not None else "?"
             resource_type = type(resource).__name__ if resource is not None else "None"
-            # Temporarily emit at INFO so we can see them in the live Homebridge
-            # log without needing HB-side debug mode. Will dial back to debug
-            # once websocket-path is verified working in the field.
             _emit_log(
-                "info",
+                "debug",
                 f"event: topic={topic_name} id={resource_id} resource_type={resource_type}",
             )
-            # --- TIMING DIAGNOSTIC (temporary) ---
-            # Log ADC-server-reported event time vs daemon receipt time so we
-            # can measure cloud→daemon latency per event.
-            try:
-                _emit_log("info", f"timing-diag-fired: topic={topic_name} id={resource_id}")
-                from datetime import datetime, timezone as _tz
-                ws = getattr(self._bridge, "ws_controller", None) if self._bridge is not None else None
-                events = list(ws.last_events) if ws is not None else []
-                # Find the most recent ws event matching this resource id, if any.
-                matched = None
-                for m in reversed(events):
-                    mid = getattr(m, "id", None) or (m.get("id") if isinstance(m, dict) else None)
-                    if mid and str(mid) == str(resource_id):
-                        matched = m
-                        break
-                if matched is None and events:
-                    matched = events[-1]
-                edt = getattr(matched, "event_date_utc", None)
-                if edt is None and isinstance(matched, dict):
-                    edt = matched.get("event_date_utc")
-                now = datetime.now(_tz.utc)
-                if edt is not None:
-                    try:
-                        delta = (now - edt).total_seconds()
-                    except Exception:
-                        delta = None
-                    _emit_log(
-                        "info",
-                        f"timing: adc_event_utc={edt} daemon_recv_utc={now.isoformat()} delta_s={delta}",
-                    )
-                else:
-                    _emit_log("info", f"timing: NO event_date_utc, events={len(events)}, last_type={type(events[-1]).__name__ if events else None}, last_raw={str(events[-1])[:500] if events else None}")
-            except Exception as _te:
-                _emit_log("warn", f"timing diag error: {type(_te).__name__}: {_te}")
-            # --- END DIAGNOSTIC ---
 
             if topic in (
                 EventBrokerTopic.RESOURCE_UPDATED,
@@ -690,13 +647,6 @@ class Daemon:
                 # what comes through for most ADT-branded sensors in practice.
                 if not resource_id:
                     return
-
-                # Observation-only diag: dump three state fields side-by-side
-                # at the moment the WS event arrives. force=True so we always
-                # emit on a real WS event, regardless of dedup state.
-                self._emit_state_diag(
-                    f"event:{topic_name}", [str(resource_id)], force=True
-                )
 
                 # Special handling for OPENED_CLOSED: ADC collapses an Open+Close
                 # pair into a single WS notification with no duration. We force-
@@ -1022,89 +972,6 @@ class Daemon:
         except Exception as e:
             _emit_log("warn", f"post-event reconcile error: {type(e).__name__}: {e}")
 
-    def _emit_state_diag(
-        self,
-        reason: str,
-        sensor_ids: list[str] | None = None,
-        force: bool = False,
-    ) -> None:
-        """OBSERVATION-ONLY (temporary): dump each sensor's three state-related
-        fields together as a JSON log line so we can verify which is the
-        cloud's authoritative open/closed signal:
-
-          - state_int       : event-flavored, mutated by WS handler
-                              (OPENED_CLOSED=9 is the suspect)
-          - open_closed_status : cloud-authoritative int, not mutated by WS
-          - display_state_text : cloud-authoritative human label
-
-        Called on every reconcile (all sensors, force=False) and on every
-        WS sensor event (affected sensor only, force=True). When force is
-        False, only emits when the snapshot differs from the previous
-        emission for that sensor — keeps log volume near-zero in steady
-        state. WS events always emit unconditionally because they're the
-        rare, important moment we don't want to dedup away.
-
-        First call after restart sees an empty `_last_diag_state` dict,
-        so every sensor emits once as a fresh baseline.
-        """
-        bridge = self._bridge
-        if bridge is None:
-            return
-        from datetime import datetime, timezone as _tz
-        ts = datetime.now(_tz.utc).isoformat()
-        try:
-            sensors_iter = list(bridge.sensors)
-        except Exception:
-            return
-        for s in sensors_iter:
-            try:
-                if sensor_ids is not None and str(s.id) not in sensor_ids:
-                    continue
-                attrs = s.api_resource.attributes
-                snapshot = (
-                    attrs.get("state"),
-                    attrs.get("open_closed_status"),
-                    attrs.get("display_state_text"),
-                    attrs.get("is_bypassed"),
-                )
-                sid = str(s.id)
-                if not force and self._last_diag_state.get(sid) == snapshot:
-                    continue
-                self._last_diag_state[sid] = snapshot
-                payload = {
-                    "ts": ts,
-                    "source": reason,
-                    "id": sid,
-                    "name": s.name,
-                    "state_int": snapshot[0],
-                    "open_closed_status": snapshot[1],
-                    "display_state_text": snapshot[2],
-                    "is_bypassed": snapshot[3],
-                }
-                _emit_log("info", "STATE_DIAG " + json.dumps(payload, default=str))
-            except Exception as e:
-                _emit_log(
-                    "warn",
-                    f"state_diag emit failed: {type(e).__name__}: {e}",
-                )
-
-    def _emit_state_diag_heartbeat(self, reason: str) -> None:
-        """OBSERVATION-ONLY (temporary): once per ~5 minutes, emit one line
-        that proves the diag path is still alive even when nothing has
-        changed (so silence in the log can't be confused with a dead
-        diagnostic). Removable with the rest of the diag scaffolding."""
-        from datetime import datetime, timezone as _tz
-        now = time.monotonic()
-        if now - self._last_diag_heartbeat_at < 300.0:
-            return
-        self._last_diag_heartbeat_at = now
-        payload = {
-            "ts": datetime.now(_tz.utc).isoformat(),
-            "reason": reason,
-            "tracked_sensors": len(self._last_diag_state),
-        }
-        _emit_log("info", "STATE_DIAG_HEARTBEAT " + json.dumps(payload, default=str))
-
     async def _opened_closed_recover_close(
         self, sensor_id: str, sensor_name: str
     ) -> None:
@@ -1295,13 +1162,6 @@ class Daemon:
             )
         if changes:
             _emit_log("info", f"reconcile ({reason}): {changes} device(s) drifted, corrected")
-
-        # Observation-only diag: dump three state fields for every sensor
-        # (only if changed since last emission — change-detection keeps
-        # steady-state log volume near zero) plus a periodic heartbeat
-        # so silence in the log can't be confused with a dead diagnostic.
-        self._emit_state_diag(f"reconcile:{reason}")
-        self._emit_state_diag_heartbeat(f"reconcile:{reason}")
 
     def _require_bridge(self) -> None:
         if self._bridge is None:
