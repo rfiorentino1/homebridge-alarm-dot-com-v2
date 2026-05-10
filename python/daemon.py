@@ -1271,6 +1271,19 @@ class Daemon:
         current = {d["id"]: d for d in self._snapshot_devices()}
         changes = 0
         for device_id, wire in current.items():
+            # Skip sensors with an in-flight OPENED_CLOSED synthetic-OPEN pulse:
+            # _opened_closed_recover_close owns this sensor's wire until it
+            # observes REST-Closed (or its safety timeout fires) and emits the
+            # eventual close itself. Without this guard, reconcile fetched fresh
+            # REST data (which always says Closed for collapsed cycles, since
+            # the open is too brief for REST to ever flip), saw _known_devices
+            # at synthetic closed=False, called it "drift", and emitted closed
+            # within 0-5s — wiping out the entire OPEN window in HK so neither
+            # users nor automations could see it. Verified 2026-05-09 from the
+            # log: 37 of 50 force-opens were stomped this way.
+            pending = self._pending_synthetic_close.get(device_id)
+            if pending is not None and not pending.done():
+                continue
             if self._known_devices.get(device_id) != wire:
                 self._known_devices[device_id] = wire
                 _emit_notification("device_updated", {"device": wire})
