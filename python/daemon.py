@@ -352,6 +352,14 @@ class Daemon:
         # because the socket blipped). Cleared only on daemon restart.
         self._authoritative_partition_state: dict[str, PartitionState] = {}
         self._authoritative_sensor_state: dict[str, SensorState] = {}
+        # ALARM-STATE CACHE. Keyed by partition id; True while an alarm /
+        # pending-alarm / panic is standing. Alarm.com's PartitionState enum
+        # has no alarm member (an alarm is a separate flag) and a PendingAlarm
+        # WS event is delivered against the violated SENSOR id, not the
+        # partition — so we track it here, keyed by partition id, and let
+        # _build_partition_wire override the wire `state` to "triggered".
+        # Set by alarm-class WS pushes; cleared on Disarmed / AlarmCancelled.
+        self._partition_alarm_active: dict[str, bool] = {}
         self._raw_unsubscribe: Callable[[], None] | None = None
         self._handlers: dict[str, MethodHandler] = {
             "login": self._login,
@@ -490,6 +498,11 @@ class Daemon:
         auth = self._authoritative_partition_state.get(str(p.id))
         if auth is not None:
             wire["state"] = _partition_state_to_wire(auth)
+        # An active / pending alarm overrides the armed/disarmed state.
+        # HomeKit's SecuritySystem accessory has a single alarm state and the
+        # Node side already maps the "triggered" wire value → ALARM_TRIGGERED.
+        if self._partition_alarm_active.get(str(p.id)):
+            wire["state"] = "triggered"
         return wire
 
     def _build_sensor_wire_contact(self, s: Sensor, *, pending_close: bool = False) -> dict:
@@ -761,6 +774,73 @@ class Daemon:
             if not full_device_id:
                 return
             rid = str(full_device_id)
+
+            # Alarm / pending-alarm / panic transitions.
+            #
+            # An alarm is NOT a value of Alarm.com's PartitionState enum — it's
+            # a separate condition — and a PendingAlarm/Alarm WS event is
+            # delivered against the violated SENSOR id, not the partition.
+            # These event subtypes are also flagged "Unsupported" in
+            # pyalarmdotcomajax, so they fire NO RESOURCE_UPDATED and on_event
+            # never runs for them — we must record the state and emit here.
+            # HomeKit's SecuritySystem has a single alarm state, so map any
+            # alarm-class event → "triggered" for every partition; clear on
+            # Disarmed / AlarmCancelled.
+            ALARM_SUBTYPES = {
+                ResourceEventType.Alarm,
+                ResourceEventType.PendingAlarm,
+                ResourceEventType.PolicePanic,
+                ResourceEventType.SilentPolicePanic,
+                ResourceEventType.PolicePanicSuspectedAlarm,
+                ResourceEventType.SilentPolicePanicSuspectedAlarm,
+                ResourceEventType.FirePanic,
+                ResourceEventType.AuxiliaryPanic,
+                ResourceEventType.AuxPanicPendingAlarm,
+                ResourceEventType.AuxPanicSuspectedAlarm,
+            }
+            bridge_alarm = self._bridge
+            partition_ids = (
+                [str(p.id) for p in bridge_alarm.partitions]
+                if bridge_alarm is not None
+                else []
+            )
+
+            def _emit_partition_wires() -> None:
+                if bridge_alarm is None or not self._expose_panel:
+                    return
+                for part in bridge_alarm.partitions:
+                    w = self._build_partition_wire(part)
+                    if self._known_devices.get(w["id"]) != w:
+                        self._known_devices[w["id"]] = w
+                        _emit_notification("device_updated", {"device": w})
+                        _emit_log("info", f"device_updated: {w.get('name')} {w}")
+
+            if subtype in ALARM_SUBTYPES:
+                for pid in partition_ids:
+                    self._partition_alarm_active[pid] = True
+                _emit_log(
+                    "info",
+                    f"ws-authoritative: ALARM triggered ({subtype.name}, src={rid}) "
+                    f"→ partitions {partition_ids}",
+                )
+                _emit_partition_wires()
+                return
+
+            if subtype == ResourceEventType.AlarmCancelled:
+                for pid in partition_ids:
+                    self._partition_alarm_active[pid] = False
+                _emit_log(
+                    "info", f"ws-authoritative: alarm cancelled ({subtype.name})"
+                )
+                _emit_partition_wires()
+                return
+
+            # A disarm also clears any standing alarm. Clear the flag here,
+            # then fall through so the partition_map block below still records
+            # the DISARMED state and the normal emit path reports "disarmed".
+            if subtype == ResourceEventType.Disarmed:
+                for pid in partition_ids:
+                    self._partition_alarm_active[pid] = False
 
             # Partition arm/disarm transitions
             partition_map = {
