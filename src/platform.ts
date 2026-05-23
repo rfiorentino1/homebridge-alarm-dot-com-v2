@@ -16,19 +16,60 @@ import { PLATFORM_NAME, PLUGIN_NAME } from './settings.js';
 import { SecurityPanelAccessory } from './accessories/panel.js';
 import { ContactSensorAccessory } from './accessories/contact-sensor.js';
 import { MotionSensorAccessory } from './accessories/motion-sensor.js';
+import { LockAccessory } from './accessories/lock.js';
+import { LightAccessory } from './accessories/light.js';
+import { ThermostatAccessory } from './accessories/thermostat.js';
+import { GarageDoorAccessory } from './accessories/garage-door.js';
+import { GateAccessory } from './accessories/gate.js';
+import { WaterSensorAccessory } from './accessories/water-sensor.js';
+import { WaterValveAccessory } from './accessories/water-valve.js';
 import type {
   ContactSensorDevice,
   Device,
   DevicesEnumeratedParams,
   DeviceUpdatedParams,
+  GarageDoorDevice,
+  GateDevice,
+  LightDevice,
+  LockDevice,
   LogParams,
   MotionSensorDevice,
   PanelDevice,
   PluginConfig,
   RpcNotification,
+  ThermostatDevice,
+  ThermostatMode,
+  WaterSensorDevice,
+  WaterValveDevice,
 } from './types.js';
 
-type AccessoryHandler = SecurityPanelAccessory | ContactSensorAccessory | MotionSensorAccessory;
+type AccessoryHandler =
+  | SecurityPanelAccessory
+  | ContactSensorAccessory
+  | MotionSensorAccessory
+  | LockAccessory
+  | LightAccessory
+  | ThermostatAccessory
+  | GarageDoorAccessory
+  | GateAccessory
+  | WaterSensorAccessory
+  | WaterValveAccessory;
+
+/**
+ * Generic action payload sent from an actuator accessory to the daemon's
+ * `device_action` RPC. The accessory builds the action shape; the platform
+ * relays it to Python without further interpretation.
+ */
+type DeviceActionPayload =
+  | { kind: 'lock'; action: 'lock' | 'unlock' }
+  | { kind: 'light'; action: 'on' | 'off' }
+  | { kind: 'light'; action: 'set_brightness'; value: number }
+  | { kind: 'thermostat'; action: 'set_mode'; value: ThermostatMode }
+  | { kind: 'thermostat'; action: 'set_heat_setpoint'; value: number }
+  | { kind: 'thermostat'; action: 'set_cool_setpoint'; value: number }
+  | { kind: 'garage_door'; action: 'open' | 'close' }
+  | { kind: 'gate'; action: 'open' | 'close' }
+  | { kind: 'water_valve'; action: 'open' | 'close' };
 
 /**
  * Homebridge DynamicPlatformPlugin entry point.
@@ -292,6 +333,20 @@ export class AlarmDotComV2Platform implements DynamicPlatformPlugin {
       handler.update(device);
     } else if (handler instanceof MotionSensorAccessory && device.kind === 'motion_sensor') {
       handler.update(device);
+    } else if (handler instanceof LockAccessory && device.kind === 'lock') {
+      handler.update(device);
+    } else if (handler instanceof LightAccessory && device.kind === 'light') {
+      handler.update(device);
+    } else if (handler instanceof ThermostatAccessory && device.kind === 'thermostat') {
+      handler.update(device);
+    } else if (handler instanceof GarageDoorAccessory && device.kind === 'garage_door') {
+      handler.update(device);
+    } else if (handler instanceof GateAccessory && device.kind === 'gate') {
+      handler.update(device);
+    } else if (handler instanceof WaterSensorAccessory && device.kind === 'water_sensor') {
+      handler.update(device);
+    } else if (handler instanceof WaterValveAccessory && device.kind === 'water_valve') {
+      handler.update(device);
     } else {
       this.log.warn(
         `[platform] handler/device kind mismatch for ${device.id}: ` +
@@ -313,6 +368,50 @@ export class AlarmDotComV2Platform implements DynamicPlatformPlugin {
         return new ContactSensorAccessory(this, accessory, device as ContactSensorDevice);
       case 'motion_sensor':
         return new MotionSensorAccessory(this, accessory, device as MotionSensorDevice);
+      case 'lock':
+        return new LockAccessory(this, accessory, device as LockDevice, (action) =>
+          this.requestDeviceAction({ kind: 'lock', action }, device.id),
+        );
+      case 'light':
+        return new LightAccessory(this, accessory, device as LightDevice, (action) => {
+          if (action.kind === 'set_brightness') {
+            return this.requestDeviceAction(
+              { kind: 'light', action: 'set_brightness', value: action.value },
+              device.id,
+            );
+          }
+          return this.requestDeviceAction(
+            { kind: 'light', action: action.kind },
+            device.id,
+          );
+        });
+      case 'thermostat':
+        return new ThermostatAccessory(this, accessory, device as ThermostatDevice, (action) => {
+          if (action.kind === 'set_mode') {
+            return this.requestDeviceAction(
+              { kind: 'thermostat', action: 'set_mode', value: action.value },
+              device.id,
+            );
+          }
+          return this.requestDeviceAction(
+            { kind: 'thermostat', action: action.kind, value: action.value },
+            device.id,
+          );
+        });
+      case 'garage_door':
+        return new GarageDoorAccessory(this, accessory, device as GarageDoorDevice, (action) =>
+          this.requestDeviceAction({ kind: 'garage_door', action }, device.id),
+        );
+      case 'gate':
+        return new GateAccessory(this, accessory, device as GateDevice, (action) =>
+          this.requestDeviceAction({ kind: 'gate', action }, device.id),
+        );
+      case 'water_sensor':
+        return new WaterSensorAccessory(this, accessory, device as WaterSensorDevice);
+      case 'water_valve':
+        return new WaterValveAccessory(this, accessory, device as WaterValveDevice, (action) =>
+          this.requestDeviceAction({ kind: 'water_valve', action }, device.id),
+        );
       default:
         this.log.warn(`[platform] unknown device kind: ${(device as Device).kind}`);
         return null;
@@ -329,6 +428,27 @@ export class AlarmDotComV2Platform implements DynamicPlatformPlugin {
       action,
       bypass_zones: this.pluginConfig.armAwayKeypadBypass ?? false,
     });
+  }
+
+  /**
+   * Forward an accessory action to the daemon's generic `device_action` RPC.
+   * Type-narrowed by `DeviceActionPayload` so each accessory can only send
+   * actions valid for its kind.
+   */
+  private async requestDeviceAction(
+    payload: DeviceActionPayload,
+    deviceId: string,
+  ): Promise<void> {
+    if (!this.bridge) throw new Error('daemon not running');
+    const params: Record<string, unknown> = {
+      device_id: deviceId,
+      kind: payload.kind,
+      action: payload.action,
+    };
+    if ('value' in payload) {
+      params.value = payload.value;
+    }
+    await this.bridge.call('device_action', params);
   }
 
   private onNotification(notif: RpcNotification): void {

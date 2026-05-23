@@ -8,7 +8,17 @@ Supported methods from Node → Python:
     enumerate_devices(include_security_panel,
                       include_contact_sensors,
                       include_motion_sensors)    → {"devices": [...]}
+                  # NB: locks, lights, thermostats, garage doors, gates,
+                  # water sensors, and water valves are always discovered
+                  # (no per-type toggle). Add toggles here if anyone ever
+                  # asks; default-on matches Rocco's "auto-discovered" ask.
     panel_action(device_id, action, bypass_zones?) → {"ok": true}
+    device_action(device_id, kind, action, value?) → {"ok": true}
+                  # Generic actuator entrypoint for non-panel devices.
+                  # `kind` is the wire kind ("lock", "light", "thermostat",
+                  # "garage_door", "gate", "water_valve").
+                  # `action` and `value` semantics are kind-specific —
+                  # see _device_action below for the full grammar.
     subscribe_updates()                          → {"ok": true}
 
 Notifications from Python → Node:
@@ -48,6 +58,33 @@ from pyalarmdotcomajax.models.sensor import (  # type: ignore[import-untyped]
     Sensor,
     SensorState,
     SensorSubtype,
+)
+from pyalarmdotcomajax.models.lock import (  # type: ignore[import-untyped]
+    Lock,
+    LockState,
+)
+from pyalarmdotcomajax.models.light import (  # type: ignore[import-untyped]
+    Light,
+    LightState,
+)
+from pyalarmdotcomajax.models.thermostat import (  # type: ignore[import-untyped]
+    Thermostat,
+    ThermostatState,
+)
+from pyalarmdotcomajax.models.garage_door import (  # type: ignore[import-untyped]
+    GarageDoor,
+    GarageDoorState,
+)
+from pyalarmdotcomajax.models.gate import (  # type: ignore[import-untyped]
+    Gate,
+    GateState,
+)
+from pyalarmdotcomajax.models.water_sensor import (  # type: ignore[import-untyped]
+    WaterSensor,
+)
+from pyalarmdotcomajax.models.water_valve import (  # type: ignore[import-untyped]
+    WaterValve,
+    WaterValveState,
 )
 from pyalarmdotcomajax.websocket.client import (  # type: ignore[import-untyped]
     RawResourceEventMessage,
@@ -226,6 +263,191 @@ def _sensor_to_wire_motion(s: Sensor) -> dict:
     return out
 
 
+# --- Lock / Light / Thermostat / Garage / Gate / Water sensor / Water valve ---
+#
+# These map straight from pyalarmdotcomajax models to a minimal wire format
+# consumed by the corresponding accessory class on the Node side. Each wire
+# builder is intentionally narrow (only the fields HomeKit needs) so the
+# accessory glue stays small and so additions don't blow up the JSON payload.
+#
+# Why no WS-authoritative cache for these (unlike partition / sensor):
+# pyalarmdotcomajax's lock / light / thermostat / garage / gate / water-valve
+# controllers each carry an `_event_state_map` (or a custom `_handle_event`)
+# that mutates the resource's attribute on the *exact* WS event the user
+# cares about — DoorLocked sets LockState.LOCKED, LightTurnedOn sets
+# LightState.ON, ThermostatModeChanged updates ATTR_STATE, etc. So reading
+# `attrs.state` immediately after a RESOURCE_UPDATED dispatch returns the
+# event-driven value, and the existing on_event → _lookup_wire → diff/emit
+# flow Just Works for these.
+#
+# The cache we maintain for partitions + sensors exists specifically to
+# suppress REST-driven *reverts* (REST lags the WS by minutes; a stale REST
+# refresh can clobber a fresh WS push). If we ever see that drift on lock /
+# light / etc. in the field, add an authoritative cache for them too.
+
+
+def _lock_to_wire(lock: Lock) -> dict:
+    attrs = lock.attributes
+    state = attrs.state
+    out: dict[str, Any] = {
+        "kind": "lock",
+        "id": str(lock.id),
+        "name": lock.name or f"Lock {lock.id}",
+        # HomeKit's LockMechanism has UNSECURED / SECURED / JAMMED / UNKNOWN.
+        # ADC has UNKNOWN / LOCKED / UNLOCKED / HIDDEN — no jam signal we
+        # can rely on. Map LOCKED→secured, UNLOCKED→unsecured, else unknown.
+        "locked": state == LockState.LOCKED,
+        "unknown": state in (LockState.UNKNOWN, LockState.HIDDEN, None),
+    }
+    low = _battery_is_low(attrs.battery_level_classification)
+    if low is not None:
+        out["lowBattery"] = low
+    return out
+
+
+def _light_to_wire(light: Light) -> dict:
+    attrs = light.attributes
+    state = attrs.state
+    out: dict[str, Any] = {
+        "kind": "light",
+        "id": str(light.id),
+        "name": light.name or f"Light {light.id}",
+        "on": state == LightState.ON,
+        "dimmer": bool(attrs.is_dimmer),
+    }
+    if attrs.is_dimmer:
+        # ADC retains the dimmer level when off so HomeKit can survive an
+        # off→on round-trip at the prior brightness.
+        out["brightness"] = max(0, min(100, int(attrs.light_level or 0)))
+    low = _battery_is_low(attrs.battery_level_classification)
+    if low is not None:
+        out["lowBattery"] = low
+    return out
+
+
+def _f_to_c(value_f: float) -> float:
+    return round((value_f - 32.0) * 5.0 / 9.0, 1)
+
+
+def _thermostat_to_wire(t: Thermostat, uses_celsius: bool) -> dict:
+    """Build the wire payload for a thermostat.
+
+    HomeKit's Thermostat characteristics are ALWAYS in Celsius internally —
+    `TemperatureDisplayUnits` only affects what the Home app shows, never the
+    raw values exchanged with the accessory. So we normalize every temperature
+    to °C here and pass `usesCelsius` separately for the display-unit hint.
+    """
+    attrs = t.attributes
+
+    def to_c(v: float | None) -> float | None:
+        if v is None:
+            return None
+        return float(v) if uses_celsius else _f_to_c(float(v))
+
+    state = attrs.state
+    if state in (ThermostatState.HEAT, ThermostatState.AUXHEAT):
+        mode = "heat"
+    elif state == ThermostatState.COOL:
+        mode = "cool"
+    elif state == ThermostatState.AUTO:
+        mode = "auto"
+    elif state == ThermostatState.OFF:
+        mode = "off"
+    else:
+        mode = "unknown"
+
+    # Prefer forwarding_ambient_temp (which includes additional sensor averaging)
+    # when present; fall back to ambient_temp. ADC sometimes reports one and
+    # not the other depending on hardware.
+    current = attrs.forwarding_ambient_temp
+    if current in (None, 0, 0.0):
+        current = attrs.ambient_temp
+
+    out: dict[str, Any] = {
+        "kind": "thermostat",
+        "id": str(t.id),
+        "name": t.name or f"Thermostat {t.id}",
+        "mode": mode,
+        "supportsAuto": bool(attrs.supports_auto_mode),
+        "supportsHeat": bool(attrs.supports_heat_mode),
+        "supportsCool": bool(attrs.supports_cool_mode),
+        "supportsOff": bool(attrs.supports_off_mode),
+        "usesCelsius": bool(uses_celsius),
+        "currentTempC": to_c(current),
+        "heatSetpointC": to_c(attrs.heat_setpoint),
+        "coolSetpointC": to_c(attrs.cool_setpoint),
+        "minHeatC": to_c(attrs.min_heat_setpoint),
+        "maxHeatC": to_c(attrs.max_heat_setpoint),
+        "minCoolC": to_c(attrs.min_cool_setpoint),
+        "maxCoolC": to_c(attrs.max_cool_setpoint),
+    }
+    if attrs.supports_humidity and attrs.humidity_level is not None:
+        out["humidity"] = max(0, min(100, int(attrs.humidity_level)))
+    return out
+
+
+def _garage_door_to_wire(g: GarageDoor) -> dict:
+    state = g.attributes.state
+    return {
+        "kind": "garage_door",
+        "id": str(g.id),
+        "name": g.name or f"Garage Door {g.id}",
+        "open": state == GarageDoorState.OPEN,
+        "closed": state == GarageDoorState.CLOSED,
+    }
+
+
+def _gate_to_wire(g: Gate) -> dict:
+    attrs = g.attributes
+    state = attrs.state
+    return {
+        "kind": "gate",
+        "id": str(g.id),
+        "name": g.name or f"Gate {g.id}",
+        "open": state == GateState.OPEN,
+        "closed": state == GateState.CLOSED,
+        # Gates can support remote OPEN without remote CLOSE (e.g. for safety).
+        # The accessory uses this to refuse a HomeKit "Close" if not supported.
+        "supportsRemoteClose": bool(getattr(attrs, "supports_remote_close", False)),
+    }
+
+
+# Water sensor states ADC reports → HomeKit "leak detected".
+# WET / OPEN / ACTIVE indicate a positive leak detection. CLOSED / DRY / IDLE
+# (or UNKNOWN) mean no leak. Defaulting to "no leak" on UNKNOWN avoids false
+# positive automations on first enumerate before WS pushes start flowing.
+_WATER_SENSOR_LEAK_STATES = {
+    SensorState.WET,
+    SensorState.OPEN,
+    SensorState.ACTIVE,
+}
+
+
+def _water_sensor_to_wire(s: WaterSensor) -> dict:
+    state = s.attributes.state
+    out: dict[str, Any] = {
+        "kind": "water_sensor",
+        "id": str(s.id),
+        "name": s.name or f"Leak Sensor {s.id}",
+        "leak": state in _WATER_SENSOR_LEAK_STATES,
+    }
+    low = _battery_is_low(s.attributes.battery_level_classification)
+    if low is not None:
+        out["lowBattery"] = low
+    return out
+
+
+def _water_valve_to_wire(v: WaterValve) -> dict:
+    state = v.attributes.state
+    return {
+        "kind": "water_valve",
+        "id": str(v.id),
+        "name": v.name or f"Water Valve {v.id}",
+        "open": state == WaterValveState.OPEN,
+        "closed": state == WaterValveState.CLOSED,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Daemon
 # ---------------------------------------------------------------------------
@@ -365,6 +587,7 @@ class Daemon:
             "login": self._login,
             "enumerate_devices": self._enumerate_devices,
             "panel_action": self._panel_action,
+            "device_action": self._device_action,
             "subscribe_updates": self._subscribe_updates,
         }
 
@@ -481,12 +704,23 @@ class Daemon:
 
         devices = self._snapshot_devices()
         self._known_devices = {d["id"]: d for d in devices}
+
+        def _count(kind: str) -> int:
+            return sum(1 for d in devices if d["kind"] == kind)
+
         _emit_log(
             "info",
             f"discovered {len(devices)} device(s): "
-            f"{sum(1 for d in devices if d['kind'] == 'panel')} panels, "
-            f"{sum(1 for d in devices if d['kind'] == 'contact_sensor')} contacts, "
-            f"{sum(1 for d in devices if d['kind'] == 'motion_sensor')} motions",
+            f"{_count('panel')} panels, "
+            f"{_count('contact_sensor')} contacts, "
+            f"{_count('motion_sensor')} motions, "
+            f"{_count('lock')} locks, "
+            f"{_count('light')} lights, "
+            f"{_count('thermostat')} thermostats, "
+            f"{_count('garage_door')} garage doors, "
+            f"{_count('gate')} gates, "
+            f"{_count('water_sensor')} water sensors, "
+            f"{_count('water_valve')} water valves",
         )
         return {"devices": devices}
 
@@ -534,36 +768,102 @@ class Daemon:
 
     def _snapshot_devices(self) -> list[dict]:
         assert self._bridge is not None
+        bridge = self._bridge
         out: list[dict] = []
 
         if self._expose_panel:
-            for p in self._bridge.partitions:
+            for p in bridge.partitions:
                 out.append(self._build_partition_wire(p))
 
         if self._expose_contacts or self._expose_motion:
-            for s in self._bridge.sensors:
+            for s in bridge.sensors:
                 subtype = getattr(s.attributes, "device_type", None)
                 if subtype in CONTACT_SUBTYPES and self._expose_contacts:
                     out.append(self._build_sensor_wire_contact(s))
                 elif subtype in MOTION_SUBTYPES and self._expose_motion:
                     out.append(self._build_sensor_wire_motion(s))
 
+        # Lock / light / thermostat / garage / gate / water_sensor / water_valve
+        # are always auto-discovered — there is no per-type config toggle.
+        # Each is best-effort: if a controller errors on iteration (e.g. an
+        # ADC account simply has none of a given kind), skip silently. We
+        # don't want one bad device class to gate the rest from enumerating.
+        for lock in bridge.locks:
+            with suppress(Exception):
+                out.append(_lock_to_wire(lock))
+        for light in bridge.lights:
+            with suppress(Exception):
+                out.append(_light_to_wire(light))
+        uses_celsius = bool(getattr(bridge.auth_controller, "use_celsius", False))
+        for thermostat in bridge.thermostats:
+            with suppress(Exception):
+                out.append(_thermostat_to_wire(thermostat, uses_celsius))
+        for garage in bridge.garage_doors:
+            with suppress(Exception):
+                out.append(_garage_door_to_wire(garage))
+        for gate in bridge.gates:
+            with suppress(Exception):
+                out.append(_gate_to_wire(gate))
+        for water in bridge.water_sensors:
+            with suppress(Exception):
+                out.append(_water_sensor_to_wire(water))
+        for valve in bridge.water_valves:
+            with suppress(Exception):
+                out.append(_water_valve_to_wire(valve))
+
         return out
 
     def _lookup_wire(self, resource_id: str) -> dict | None:
         """Find the current wire representation for a resource id, or None if we don't expose it."""
         assert self._bridge is not None
-        partition = self._bridge.partitions.get(resource_id)
+        bridge = self._bridge
+
+        partition = bridge.partitions.get(resource_id)
         if partition is not None and self._expose_panel:
             return self._build_partition_wire(partition)
 
-        sensor = self._bridge.sensors.get(resource_id)
+        sensor = bridge.sensors.get(resource_id)
         if sensor is not None:
             subtype = getattr(sensor.attributes, "device_type", None)
             if subtype in CONTACT_SUBTYPES and self._expose_contacts:
                 return self._build_sensor_wire_contact(sensor)
             if subtype in MOTION_SUBTYPES and self._expose_motion:
                 return self._build_sensor_wire_motion(sensor)
+
+        # New device kinds — always discovered, so no config gate. Resource
+        # IDs are globally unique across kinds in ADC so it's safe to check
+        # each collection in turn; the first hit wins.
+        lock = bridge.locks.get(resource_id)
+        if lock is not None:
+            return _lock_to_wire(lock)
+
+        light = bridge.lights.get(resource_id)
+        if light is not None:
+            return _light_to_wire(light)
+
+        thermostat = bridge.thermostats.get(resource_id)
+        if thermostat is not None:
+            uses_celsius = bool(
+                getattr(bridge.auth_controller, "use_celsius", False)
+            )
+            return _thermostat_to_wire(thermostat, uses_celsius)
+
+        garage = bridge.garage_doors.get(resource_id)
+        if garage is not None:
+            return _garage_door_to_wire(garage)
+
+        gate = bridge.gates.get(resource_id)
+        if gate is not None:
+            return _gate_to_wire(gate)
+
+        water = bridge.water_sensors.get(resource_id)
+        if water is not None:
+            return _water_sensor_to_wire(water)
+
+        valve = bridge.water_valves.get(resource_id)
+        if valve is not None:
+            return _water_valve_to_wire(valve)
+
         return None
 
     # ----- panel action -----
@@ -592,6 +892,130 @@ class Daemon:
             await partitions.arm_away(str(device_id), force_bypass=bypass)
         elif action == "arm_night":
             await partitions.arm_night(str(device_id), force_bypass=bypass)
+
+        return {"ok": True}
+
+    # ----- device action (lock / light / thermostat / garage / gate / valve) -----
+
+    async def _device_action(self, params: dict) -> dict:
+        """Generic actuator entrypoint for non-panel device kinds.
+
+        Wire grammar (kind, action, value):
+            lock        action ∈ {"lock", "unlock"}                              (no value)
+            light       action ∈ {"on", "off"}                                   (no value)
+                        action == "set_brightness", value = int 0..100
+            thermostat  action == "set_mode",      value = {"off","heat","cool","auto"}
+                        action == "set_heat_setpoint", value = float (°C)
+                        action == "set_cool_setpoint", value = float (°C)
+            garage_door action ∈ {"open", "close"}                               (no value)
+            gate        action ∈ {"open", "close"}                               (no value)
+            water_valve action ∈ {"open", "close"}                               (no value)
+
+        Returns {"ok": True} on success; raises on auth / network / unsupported.
+        """
+        self._require_bridge()
+        bridge = self._bridge
+        assert bridge is not None
+
+        device_id = params.get("device_id")
+        kind = params.get("kind")
+        action = params.get("action")
+        value = params.get("value")
+
+        if not device_id:
+            raise ValueError("device_id is required")
+        if not kind:
+            raise ValueError("kind is required")
+        if not action:
+            raise ValueError("action is required")
+
+        rid = str(device_id)
+
+        if kind == "lock":
+            if action == "lock":
+                await bridge.locks.lock(rid)
+            elif action == "unlock":
+                await bridge.locks.unlock(rid)
+            else:
+                raise ValueError(f"unknown lock action: {action}")
+
+        elif kind == "light":
+            if action == "on":
+                await bridge.lights.turn_on(rid)
+            elif action == "off":
+                await bridge.lights.turn_off(rid)
+            elif action == "set_brightness":
+                if value is None:
+                    raise ValueError("set_brightness requires a value 0..100")
+                brightness = max(0, min(100, int(value)))
+                await bridge.lights.set_brightness(rid, brightness)
+            else:
+                raise ValueError(f"unknown light action: {action}")
+
+        elif kind == "thermostat":
+            uses_celsius = bool(
+                getattr(bridge.auth_controller, "use_celsius", False)
+            )
+            if action == "set_mode":
+                mode_map = {
+                    "off": ThermostatState.OFF,
+                    "heat": ThermostatState.HEAT,
+                    "cool": ThermostatState.COOL,
+                    "auto": ThermostatState.AUTO,
+                }
+                if not isinstance(value, str) or value not in mode_map:
+                    raise ValueError(f"unknown thermostat mode: {value}")
+                await bridge.thermostats.set_state(id=rid, state=mode_map[value])
+            elif action == "set_heat_setpoint":
+                if value is None:
+                    raise ValueError("set_heat_setpoint requires a numeric value (°C)")
+                temp_c = float(value)
+                # HomeKit always speaks °C; ADC speaks whatever Identity.use_celsius
+                # says. Convert before forwarding.
+                target = temp_c if uses_celsius else round(temp_c * 9.0 / 5.0 + 32.0, 1)
+                await bridge.thermostats.set_state(id=rid, heat_setpoint=target)
+            elif action == "set_cool_setpoint":
+                if value is None:
+                    raise ValueError("set_cool_setpoint requires a numeric value (°C)")
+                temp_c = float(value)
+                target = temp_c if uses_celsius else round(temp_c * 9.0 / 5.0 + 32.0, 1)
+                await bridge.thermostats.set_state(id=rid, cool_setpoint=target)
+            else:
+                raise ValueError(f"unknown thermostat action: {action}")
+
+        elif kind == "garage_door":
+            if action == "open":
+                await bridge.garage_doors.open(rid)
+            elif action == "close":
+                await bridge.garage_doors.close(rid)
+            else:
+                raise ValueError(f"unknown garage_door action: {action}")
+
+        elif kind == "gate":
+            if action == "open":
+                await bridge.gates.open(rid)
+            elif action == "close":
+                gate = bridge.gates.get(rid)
+                if gate is not None and not bool(
+                    getattr(gate.attributes, "supports_remote_close", False)
+                ):
+                    raise RuntimeError(
+                        "Gate does not support remote close on this account"
+                    )
+                await bridge.gates.close(rid)
+            else:
+                raise ValueError(f"unknown gate action: {action}")
+
+        elif kind == "water_valve":
+            if action == "open":
+                await bridge.water_valves.open(rid)
+            elif action == "close":
+                await bridge.water_valves.close(rid)
+            else:
+                raise ValueError(f"unknown water_valve action: {action}")
+
+        else:
+            raise ValueError(f"device_action: unsupported kind: {kind}")
 
         return {"ok": True}
 

@@ -25,7 +25,20 @@ export interface PluginConfig {
 }
 
 /** Top-level device categories the plugin exposes. Keep in sync with daemon.py. */
-export type DeviceKind = 'panel' | 'contact_sensor' | 'motion_sensor';
+export type DeviceKind =
+  | 'panel'
+  | 'contact_sensor'
+  | 'motion_sensor'
+  | 'lock'
+  | 'light'
+  | 'thermostat'
+  | 'garage_door'
+  | 'gate'
+  | 'water_sensor'
+  | 'water_valve';
+
+/** Thermostat operating mode, as reported by the daemon. */
+export type ThermostatMode = 'off' | 'heat' | 'cool' | 'auto' | 'unknown';
 
 /** Security-panel arming states from Alarm.com. Strings are exactly what the API returns. */
 export type PanelState =
@@ -64,7 +77,112 @@ export interface MotionSensorDevice {
   lowBattery?: boolean;
 }
 
-export type Device = PanelDevice | ContactSensorDevice | MotionSensorDevice;
+export interface LockDevice {
+  kind: 'lock';
+  id: string;
+  name: string;
+  /** `true` = currently locked. */
+  locked: boolean;
+  /** `true` = state is UNKNOWN/HIDDEN; HomeKit should show Unknown rather than guessing. */
+  unknown: boolean;
+  lowBattery?: boolean;
+}
+
+export interface LightDevice {
+  kind: 'light';
+  id: string;
+  name: string;
+  /** Power state. */
+  on: boolean;
+  /** Whether the light is a dimmer; only then is `brightness` meaningful. */
+  dimmer: boolean;
+  /** 0..100. Only present when `dimmer=true`. */
+  brightness?: number;
+  lowBattery?: boolean;
+}
+
+export interface ThermostatDevice {
+  kind: 'thermostat';
+  id: string;
+  name: string;
+  /** Current operating mode (target heating/cooling state, in HomeKit terms). */
+  mode: ThermostatMode;
+  supportsAuto: boolean;
+  supportsHeat: boolean;
+  supportsCool: boolean;
+  supportsOff: boolean;
+  /** Identity.use_celsius — controls HomeKit display unit, not value semantics. */
+  usesCelsius: boolean;
+  /** All temperatures below are in °C — HomeKit's internal unit. */
+  currentTempC: number | null;
+  heatSetpointC: number | null;
+  coolSetpointC: number | null;
+  minHeatC: number | null;
+  maxHeatC: number | null;
+  minCoolC: number | null;
+  maxCoolC: number | null;
+  /** 0..100 if the thermostat reports humidity. */
+  humidity?: number;
+}
+
+export interface GarageDoorDevice {
+  kind: 'garage_door';
+  id: string;
+  name: string;
+  open: boolean;
+  closed: boolean;
+}
+
+export interface GateDevice {
+  kind: 'gate';
+  id: string;
+  name: string;
+  open: boolean;
+  closed: boolean;
+  /** Some gates only support remote OPEN (for safety). HomeKit Close will fail if false. */
+  supportsRemoteClose: boolean;
+}
+
+export interface WaterSensorDevice {
+  kind: 'water_sensor';
+  id: string;
+  name: string;
+  /** `true` = leak detected. */
+  leak: boolean;
+  lowBattery?: boolean;
+}
+
+export interface WaterValveDevice {
+  kind: 'water_valve';
+  id: string;
+  name: string;
+  /** Valve open = active/in-use in HomeKit. */
+  open: boolean;
+  closed: boolean;
+}
+
+export type Device =
+  | PanelDevice
+  | ContactSensorDevice
+  | MotionSensorDevice
+  | LockDevice
+  | LightDevice
+  | ThermostatDevice
+  | GarageDoorDevice
+  | GateDevice
+  | WaterSensorDevice
+  | WaterValveDevice;
+
+/**
+ * Generic device-action grammar (matches `device_action` in daemon.py).
+ * See the daemon docstring for action/value semantics per kind.
+ */
+export interface DeviceActionRequest {
+  device_id: string;
+  kind: Exclude<DeviceKind, 'panel' | 'contact_sensor' | 'motion_sensor' | 'water_sensor'>;
+  action: string;
+  value?: string | number | boolean | null;
+}
 
 /**
  * JSON-RPC 2.0 types for talking to the Python daemon.
