@@ -582,6 +582,9 @@ class Daemon:
         # _build_partition_wire override the wire `state` to "triggered".
         # Set by alarm-class WS pushes; cleared on Disarmed / AlarmCancelled.
         self._partition_alarm_active: dict[str, bool] = {}
+        # Tracks partitions we've already logged an auto-skip for, so the
+        # "no permission to change state" notice doesn't repeat every reconcile.
+        self._logged_panel_skip: dict[str, bool] = {}
         self._raw_unsubscribe: Callable[[], None] | None = None
         self._handlers: dict[str, MethodHandler] = {
             "login": self._login,
@@ -773,6 +776,21 @@ class Daemon:
 
         if self._expose_panel:
             for p in bridge.partitions:
+                # Smart-home-only ADC accounts (locks/lights/thermostats with
+                # no actual security system) get a placeholder SYSTEM partition
+                # from the API that the user cannot arm/disarm. Skip it so users
+                # don't see a useless dummy panel in HomeKit. Real panels have
+                # has_permission_to_change_state=True.
+                if not getattr(p.attributes, "has_permission_to_change_state", True):
+                    if not self._logged_panel_skip.get(str(p.id)):
+                        self._logged_panel_skip[str(p.id)] = True
+                        log.info(
+                            "Skipping partition %s (%s): account has no permission to change state — "
+                            "likely a placeholder for a smart-home-only account with no actual security system. "
+                            "Set exposeSecurityPanel=false to silence this entirely, or ignore.",
+                            p.name or str(p.id), str(p.id),
+                        )
+                    continue
                 out.append(self._build_partition_wire(p))
 
         if self._expose_contacts or self._expose_motion:
