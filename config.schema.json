@@ -2,7 +2,7 @@
   "pluginAlias": "AlarmDotComV2",
   "pluginType": "platform",
   "singular": true,
-  "headerDisplay": "Event-driven Homebridge plugin for Alarm.com-backed security systems (ADT Control, ADT Command, ADT+, Brinks, and others). Requires Python 3.13+ on your Homebridge host; the plugin auto-installs `pyalarmdotcomajax` in a private venv on first run.",
+  "headerDisplay": "Event-driven Homebridge plugin for Alarm.com-backed security systems (ADT Control, ADT Command, ADT+, Brinks, and others). On first run the plugin sets up its own private Python environment under the Homebridge storage dir, downloading a portable CPython 3.13 if your host doesn't already have one. No system Python setup required.",
   "footerDisplay": "If your account has 2FA enabled, run `python -m pyalarmdotcomajax` once in the plugin's venv to capture a remember-me cookie, then paste it into the 2FA field in Advanced settings.",
   "schema": {
     "type": "object",

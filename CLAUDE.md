@@ -10,7 +10,13 @@ etc.) security system to HomeKit: Security Panel + contact & motion sensors.
   on stdin/stdout. **Shipped verbatim** in the npm package (the `python/` dir is
   in package.json `files`) — it is NOT compiled.
 - On first run the plugin bootstraps a private venv on the Homebridge host and
-  pip-installs `pyalarmdotcomajax` into it.
+  pip-installs `pyalarmdotcomajax` into it. The bootstrap prefers a system
+  `python3.13+` (or any earlier candidate satisfying `MIN_PYTHON_VERSION`); if
+  none is available, it downloads a portable CPython 3.13 from
+  astral-sh/python-build-standalone (release pinned in
+  `src/settings.ts:MANAGED_PYTHON_RELEASE`), SHA-256-verifies against the
+  release's `SHA256SUMS`, and uses that. The managed Python lives under
+  `<state>/python/` and is reused across restarts.
 
 ## Layout
 - `src/` — TypeScript source. `src/accessories/panel.ts` maps the wire panel

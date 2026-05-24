@@ -1,22 +1,33 @@
 import { execFile } from 'child_process';
-import { promises as fs } from 'fs';
+import { createHash } from 'crypto';
+import { createWriteStream, promises as fs } from 'fs';
+import { tmpdir } from 'os';
 import { resolve as pathResolve, join as pathJoin } from 'path';
+import { Readable } from 'stream';
+import { pipeline } from 'stream/promises';
 import { promisify } from 'util';
 
 import { Logger } from 'homebridge';
 
-import { MIN_PYTHON_VERSION, PLUGIN_STATE_SUBDIR, PYALARMDOTCOMAJAX_SPEC } from './settings.js';
+import {
+  MANAGED_PYTHON_RELEASE,
+  MANAGED_PYTHON_VERSION,
+  MIN_PYTHON_VERSION,
+  PLUGIN_STATE_SUBDIR,
+  PYALARMDOTCOMAJAX_SPEC,
+} from './settings.js';
 
 const execFileAsync = promisify(execFile);
 
 /**
  * Handles first-time and ongoing Python environment setup for the plugin:
- *   - locates a suitable Python 3.13+ binary
+ *   - locates a suitable Python 3.13+ binary (system, previously-managed, or
+ *     freshly downloaded from python-build-standalone)
  *   - creates a per-plugin virtualenv under the Homebridge storage dir
  *   - pip-installs/upgrades pyalarmdotcomajax as needed
  *
- * The venv is stored outside the plugin's npm install dir so that `npm update`
- * or plugin removal/re-add doesn't destroy it.
+ * The venv (and any managed Python) are stored outside the plugin's npm install
+ * dir so that `npm update` or plugin removal/re-add doesn't destroy them.
  */
 export class Bootstrap {
   /** Absolute path to the plugin's state directory (e.g. ~/.homebridge/alarm-dot-com-v2). */
@@ -25,6 +36,10 @@ export class Bootstrap {
   readonly venvDir: string;
   /** Absolute path to the venv's Python binary. */
   readonly venvPython: string;
+  /** Absolute path to the managed CPython install root, if one is needed. */
+  readonly managedPythonDir: string;
+  /** Absolute path to the managed CPython binary, if one is needed. */
+  readonly managedPython: string;
 
   constructor(
     homebridgeStorageDir: string,
@@ -33,6 +48,8 @@ export class Bootstrap {
     this.stateDir = pathResolve(homebridgeStorageDir, PLUGIN_STATE_SUBDIR);
     this.venvDir = pathJoin(this.stateDir, 'venv');
     this.venvPython = pathJoin(this.venvDir, 'bin', 'python');
+    this.managedPythonDir = pathJoin(this.stateDir, 'python');
+    this.managedPython = pathJoin(this.managedPythonDir, 'bin', 'python3.13');
   }
 
   /**
@@ -44,7 +61,7 @@ export class Bootstrap {
   async ensureReady(explicitPython?: string): Promise<string> {
     await fs.mkdir(this.stateDir, { recursive: true });
 
-    const systemPython = explicitPython ?? (await this.findSystemPython());
+    const systemPython = explicitPython ?? (await this.findOrInstallPython());
     this.log.debug(`[bootstrap] system python: ${systemPython}`);
 
     await this.ensureVenv(systemPython);
@@ -53,27 +70,54 @@ export class Bootstrap {
     return this.venvPython;
   }
 
-  /** Locate a `python3.13` (or newer) binary on PATH. Throws with clear guidance if none is found. */
-  private async findSystemPython(): Promise<string> {
+  /**
+   * Resolve a Python interpreter satisfying MIN_PYTHON_VERSION. Tries in order:
+   *   1. A previously-downloaded managed Python at `<state>/python/bin/python3.13`.
+   *   2. A system `python3.13` (or newer) on PATH.
+   *   3. Download python-build-standalone and use the binary inside.
+   */
+  private async findOrInstallPython(): Promise<string> {
+    if (await this.pathSatisfiesMinVersion(this.managedPython)) {
+      this.log.debug(`[bootstrap] using cached managed python: ${this.managedPython}`);
+      return this.managedPython;
+    }
+
+    const systemPython = await this.findSystemPython();
+    if (systemPython) {
+      return systemPython;
+    }
+
+    this.log.info(
+      `[bootstrap] No system Python ${MIN_PYTHON_VERSION}+ found. Downloading managed CPython ${MANAGED_PYTHON_VERSION} from python-build-standalone (one-time, ~30 MB)…`,
+    );
+    return this.installManagedPython();
+  }
+
+  /** Locate a `python3.13` (or newer) binary on PATH. Returns null if none found. */
+  private async findSystemPython(): Promise<string | null> {
     const candidates = ['python3.13', 'python3.14', 'python3.15', 'python3'];
     for (const name of candidates) {
-      try {
-        const { stdout } = await execFileAsync(name, ['--version']);
-        const match = stdout.match(/Python (\d+)\.(\d+)/);
-        if (!match) continue;
-        const [, maj, min] = match;
-        if (this.satisfiesMinVersion(Number(maj), Number(min))) {
-          return name;
-        }
-      } catch {
-        // Candidate not found; continue.
+      if (await this.pathSatisfiesMinVersion(name)) {
+        return name;
       }
     }
-    throw new Error(
-      `Could not find a Python ${MIN_PYTHON_VERSION}+ interpreter on PATH. ` +
-        `Install Python ${MIN_PYTHON_VERSION} (e.g. via apt, brew, or python.org) and ` +
-        `restart Homebridge. You can also set the "Python executable path" option in the plugin config.`,
-    );
+    return null;
+  }
+
+  /**
+   * Return true if `binary` (a path or PATH-resolved name) is a working Python
+   * >= MIN_PYTHON_VERSION.
+   */
+  private async pathSatisfiesMinVersion(binary: string): Promise<boolean> {
+    try {
+      const { stdout } = await execFileAsync(binary, ['--version']);
+      const match = stdout.match(/Python (\d+)\.(\d+)/);
+      if (!match) return false;
+      const [, maj, min] = match;
+      return this.satisfiesMinVersion(Number(maj), Number(min));
+    } catch {
+      return false;
+    }
   }
 
   private satisfiesMinVersion(maj: number, min: number): boolean {
@@ -81,6 +125,89 @@ export class Bootstrap {
     if (maj > reqMaj) return true;
     if (maj < reqMaj) return false;
     return min >= reqMin;
+  }
+
+  /**
+   * Download python-build-standalone for the current OS/arch, verify SHA-256
+   * against the release's `SHA256SUMS`, extract under `<state>/python/`, and
+   * return the path to the resulting python binary.
+   */
+  private async installManagedPython(): Promise<string> {
+    const target = managedPythonTarget();
+    const release = MANAGED_PYTHON_RELEASE;
+    const version = MANAGED_PYTHON_VERSION;
+    const tarballName = `cpython-${version}+${release}-${target}-install_only_stripped.tar.gz`;
+    const baseUrl = `https://github.com/astral-sh/python-build-standalone/releases/download/${release}`;
+    const tarballUrl = `${baseUrl}/${tarballName}`;
+    const sha256SumsUrl = `${baseUrl}/SHA256SUMS`;
+
+    // Fetch the expected SHA-256 from the release's aggregate sums file.
+    const expectedSha = await this.fetchExpectedSha256(sha256SumsUrl, tarballName);
+
+    // Download tarball to a tmp file, hashing as we go.
+    const tmpTarball = pathJoin(await fs.mkdtemp(pathJoin(tmpdir(), 'hb-adc-py-')), tarballName);
+    this.log.debug(`[bootstrap] downloading ${tarballUrl}`);
+    const actualSha = await this.downloadWithHash(tarballUrl, tmpTarball);
+    if (actualSha !== expectedSha) {
+      await fs.rm(tmpTarball, { force: true });
+      throw new Error(
+        `[bootstrap] managed Python download failed integrity check (expected ${expectedSha}, got ${actualSha})`,
+      );
+    }
+
+    // Extract into the managed python dir. The install_only tarball contains a
+    // top-level `python/` directory with `bin/`, `lib/`, etc. We extract into a
+    // staging dir and then move into place atomically-ish.
+    const stagingDir = await fs.mkdtemp(pathJoin(tmpdir(), 'hb-adc-pyx-'));
+    this.log.debug(`[bootstrap] extracting ${tmpTarball} -> ${stagingDir}`);
+    await execFileAsync('tar', ['-xzf', tmpTarball, '-C', stagingDir]);
+
+    // Remove any pre-existing managed install (e.g. failed prior attempt).
+    await fs.rm(this.managedPythonDir, { recursive: true, force: true });
+    await fs.mkdir(pathResolve(this.managedPythonDir, '..'), { recursive: true });
+    await fs.rename(pathJoin(stagingDir, 'python'), this.managedPythonDir);
+
+    // Clean up tmp.
+    await fs.rm(stagingDir, { recursive: true, force: true });
+    await fs.rm(pathResolve(tmpTarball, '..'), { recursive: true, force: true });
+
+    if (!(await this.pathSatisfiesMinVersion(this.managedPython))) {
+      throw new Error(
+        `[bootstrap] downloaded managed Python at ${this.managedPython} did not satisfy ${MIN_PYTHON_VERSION}+`,
+      );
+    }
+    this.log.info(`[bootstrap] managed Python ready at ${this.managedPython}`);
+    return this.managedPython;
+  }
+
+  private async fetchExpectedSha256(sumsUrl: string, assetName: string): Promise<string> {
+    const res = await fetch(sumsUrl);
+    if (!res.ok) {
+      throw new Error(`[bootstrap] failed to fetch ${sumsUrl}: HTTP ${res.status}`);
+    }
+    const text = await res.text();
+    // Format: "<hash>  <filename>" per line.
+    for (const line of text.split('\n')) {
+      const m = line.trim().match(/^([0-9a-f]{64})\s+(.+)$/i);
+      if (m && m[2] === assetName) {
+        return m[1].toLowerCase();
+      }
+    }
+    throw new Error(`[bootstrap] could not find ${assetName} in SHA256SUMS at ${sumsUrl}`);
+  }
+
+  private async downloadWithHash(url: string, destPath: string): Promise<string> {
+    const res = await fetch(url, { redirect: 'follow' });
+    if (!res.ok || !res.body) {
+      throw new Error(`[bootstrap] failed to fetch ${url}: HTTP ${res.status}`);
+    }
+    const hash = createHash('sha256');
+    const sink = createWriteStream(destPath);
+    // Tee the body through the hash and into the file.
+    const source = Readable.fromWeb(res.body as Parameters<typeof Readable.fromWeb>[0]);
+    source.on('data', (chunk: Buffer) => hash.update(chunk));
+    await pipeline(source, sink);
+    return hash.digest('hex');
   }
 
   private async ensureVenv(systemPython: string): Promise<void> {
@@ -112,4 +239,19 @@ export class Bootstrap {
     ]);
     this.log.debug(`[bootstrap] pyalarmdotcomajax install complete`);
   }
+}
+
+/**
+ * Map Node's `process.platform` + `process.arch` to a python-build-standalone
+ * release target string. Throws if the runtime is unsupported by upstream.
+ */
+function managedPythonTarget(): string {
+  const { platform, arch } = process;
+  if (platform === 'linux' && arch === 'arm64') return 'aarch64-unknown-linux-gnu';
+  if (platform === 'linux' && arch === 'x64') return 'x86_64-unknown-linux-gnu';
+  if (platform === 'darwin' && arch === 'arm64') return 'aarch64-apple-darwin';
+  if (platform === 'darwin' && arch === 'x64') return 'x86_64-apple-darwin';
+  throw new Error(
+    `[bootstrap] no managed Python available for ${platform}/${arch}. Install Python ${MIN_PYTHON_VERSION}+ manually and set the "Python executable path" plugin option.`,
+  );
 }

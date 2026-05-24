@@ -21,3 +21,12 @@ export const PYALARMDOTCOMAJAX_SPEC = 'pyalarmdotcomajax>=0.6.0b9,<0.8.0';
 
 /** Directory (relative to Homebridge storage) where the plugin keeps its private venv and state. */
 export const PLUGIN_STATE_SUBDIR = 'alarm-dot-com-v2';
+
+/**
+ * If no suitable system Python is found, the plugin downloads a managed CPython
+ * from astral-sh/python-build-standalone. Pinning a known-good release means we
+ * never get surprised by upstream packaging changes; bump these two strings to
+ * pick up a newer Python.
+ */
+export const MANAGED_PYTHON_RELEASE = '20260510';
+export const MANAGED_PYTHON_VERSION = '3.13.13';
