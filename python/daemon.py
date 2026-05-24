@@ -784,7 +784,7 @@ class Daemon:
                 if not getattr(p.attributes, "has_permission_to_change_state", True):
                     if not self._logged_panel_skip.get(str(p.id)):
                         self._logged_panel_skip[str(p.id)] = True
-                        log.info(
+                        logging.info(
                             "Skipping partition %s (%s): account has no permission to change state — "
                             "likely a placeholder for a smart-home-only account with no actual security system. "
                             "Set exposeSecurityPanel=false to silence this entirely, or ignore.",
