@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Alarm.com v2 setup</title>
+</head>
+<body>
+  <div id="root" class="container-fluid p-3">
+    <!-- Step: Welcome / login form -->
+    <section data-step="idle" hidden>
+      <h5 class="mb-2">Sign in to Alarm.com</h5>
+      <p class="text-muted small mb-3">
+        Enter your Alarm.com (or ADT Control / ADT Command / ADT+ / Brinks) credentials.
+        If your account has two-factor authentication enabled, you'll be prompted for a code
+        next. The plugin stores a remember-me cookie so you only need to do this once.
+      </p>
+      <div class="mb-2">
+        <label class="form-label small">Email</label>
+        <input id="f-username" type="email" autocomplete="username" class="form-control" placeholder="you@example.com" />
+      </div>
+      <div class="mb-3">
+        <label class="form-label small">Password</label>
+        <input id="f-password" type="password" autocomplete="current-password" class="form-control" />
+      </div>
+      <button id="btn-login" class="btn btn-primary" type="button">Sign in</button>
+      <button id="btn-cancel" class="btn btn-link" type="button" hidden>Cancel</button>
+    </section>
+
+    <!-- Step: Logging in -->
+    <section data-step="logging-in" hidden>
+      <h5 class="mb-2">Signing in…</h5>
+      <p class="text-muted small">Contacting Alarm.com.</p>
+    </section>
+
+    <!-- Step: OTP method picker -->
+    <section data-step="otp-pick" hidden>
+      <h5 class="mb-2">Two-factor authentication</h5>
+      <p class="text-muted small mb-3">
+        Your account has 2FA enabled. Pick how you want to receive the code.
+      </p>
+      <div id="otp-methods" class="mb-3"></div>
+      <button id="btn-send-otp" class="btn btn-primary" type="button" disabled>Send code</button>
+      <button id="btn-otp-back" class="btn btn-link" type="button">Back</button>
+    </section>
+
+    <!-- Step: Enter code -->
+    <section data-step="otp-enter" hidden>
+      <h5 class="mb-2">Enter verification code</h5>
+      <p class="text-muted small mb-3" id="otp-sent-detail">A code has been sent.</p>
+      <div class="mb-3">
+        <label class="form-label small">6-digit code</label>
+        <input id="f-otp" type="text" inputmode="numeric" autocomplete="one-time-code"
+               pattern="[0-9]*" maxlength="8" class="form-control" />
+      </div>
+      <button id="btn-verify" class="btn btn-primary" type="button">Verify & save</button>
+      <button id="btn-resend" class="btn btn-link" type="button">Resend code</button>
+    </section>
+
+    <!-- Step: Saving / success -->
+    <section data-step="saving" hidden>
+      <h5 class="mb-2">Saving…</h5>
+    </section>
+
+    <section data-step="success" hidden>
+      <h5 class="mb-2 text-success">Connected!</h5>
+      <p>
+        <span id="success-detail">Plugin is configured.</span>
+        Click <strong>Close</strong> below to apply, then restart Homebridge for the changes to take effect.
+      </p>
+      <button id="btn-restart-flow" class="btn btn-link" type="button">Set up a different account</button>
+    </section>
+
+    <section data-step="error" hidden>
+      <div class="alert alert-danger" id="error-detail">Something went wrong.</div>
+      <button id="btn-retry" class="btn btn-primary" type="button">Try again</button>
+    </section>
+  </div>
+
+  <script src="index.js"></script>
+</body>
+</html>

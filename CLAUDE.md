@@ -9,6 +9,16 @@ etc.) security system to HomeKit: Security Panel + contact & motion sensors.
   0.6.x). Communicates with the Node plugin over newline-delimited JSON-RPC 2.0
   on stdin/stdout. **Shipped verbatim** in the npm package (the `python/` dir is
   in package.json `files`) — it is NOT compiled.
+- **Custom Homebridge UI** (`homebridge-ui/`) — plain Node + HTML, served by
+  homebridge-config-ui-x. `server.js` (HomebridgePluginUiServer) handles
+  `/discover` / `/request-otp` / `/submit-otp` from the frontend by spawning a
+  one-shot Python helper (`python/ui_auth.py`) that drives the ADC auth flow
+  and (for `submit-otp`) reads the trusted-device cookie directly from the
+  bridge's persistent cookie jar — the lib's own `submit_otp()` return value
+  is unreliable in 0.6.0b9 because its middleware only watches per-response
+  cookies and the trust-device response doesn't re-emit it. The UI persists
+  username + password + captured `mfaCookie` back to plugin config via
+  `homebridge.updatePluginConfig` + `homebridge.savePluginConfig`.
 - On first run the plugin bootstraps a private venv on the Homebridge host and
   pip-installs `pyalarmdotcomajax` into it. The bootstrap prefers a system
   `python3.13+` (or any earlier candidate satisfying `MIN_PYTHON_VERSION`); if
@@ -17,6 +27,11 @@ etc.) security system to HomeKit: Security Panel + contact & motion sensors.
   `src/settings.ts:MANAGED_PYTHON_RELEASE`), SHA-256-verifies against the
   release's `SHA256SUMS`, and uses that. The managed Python lives under
   `<state>/python/` and is reused across restarts.
+  - The UI server reuses the same venv (resolved as
+    `<homebridgeStoragePath>/alarm-dot-com-v2/venv/bin/python`), so the
+    Sign in screen requires the plugin to have bootstrapped at least once.
+    On a brand-new install, the user saves any value once to trigger the
+    daemon's first launch, then returns to the Sign in screen.
 
 ## Layout
 - `src/` — TypeScript source. `src/accessories/panel.ts` maps the wire panel

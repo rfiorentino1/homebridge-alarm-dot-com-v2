@@ -40,7 +40,9 @@
     "homebridge": "^1.8.0 || ^2.0.0",
     "node": ">=18.20.0 || ^20.15.0 || ^22.0.0"
   },
-  "dependencies": {},
+  "dependencies": {
+    "@homebridge/plugin-ui-utils": "^2.2.3"
+  },
   "devDependencies": {
     "@types/node": "^22.10.0",
     "@typescript-eslint/eslint-plugin": "^8.18.0",
@@ -54,6 +56,7 @@
   "files": [
     "dist",
     "python",
+    "homebridge-ui",
     "config.schema.json",
     "README.md",
     "LICENSE"
