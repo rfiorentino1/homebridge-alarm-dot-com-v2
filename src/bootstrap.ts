@@ -1,4 +1,4 @@
-import { execFile } from 'child_process';
+import { execFile, spawn } from 'child_process';
 import { createHash } from 'crypto';
 import { createWriteStream, promises as fs } from 'fs';
 import { tmpdir } from 'os';
@@ -158,9 +158,15 @@ export class Bootstrap {
     // Extract into the managed python dir. The install_only tarball contains a
     // top-level `python/` directory with `bin/`, `lib/`, etc. We extract into a
     // staging dir and then move into place atomically-ish.
+    //
+    // tar may exit non-zero on some hosts (e.g. QNAP's Docker bind-mounted
+    // overlay returns EFAULT when tar tries to chmod symlinks inside terminfo).
+    // The actual file data extracts fine in those cases, so we ignore tar's
+    // exit code and rely on the downstream validation (python --version + venv
+    // create + pip install) to catch genuine corruption.
     const stagingDir = await fs.mkdtemp(pathJoin(tmpdir(), 'hb-adc-pyx-'));
     this.log.debug(`[bootstrap] extracting ${tmpTarball} -> ${stagingDir}`);
-    await execFileAsync('tar', ['-xzf', tmpTarball, '-C', stagingDir]);
+    await this.extractTarballIgnoringExit(tmpTarball, stagingDir);
 
     // Remove any pre-existing managed install (e.g. failed prior attempt).
     await fs.rm(this.managedPythonDir, { recursive: true, force: true });
@@ -194,6 +200,42 @@ export class Bootstrap {
       }
     }
     throw new Error(`[bootstrap] could not find ${assetName} in SHA256SUMS at ${sumsUrl}`);
+  }
+
+  /**
+   * Run `tar -xzf src -C dest` without throwing on non-zero exit. python-build-
+   * standalone tarballs contain many symlinks under `share/terminfo/` and a
+   * handful under `bin/`; some container filesystems (notably QNAP's Docker
+   * overlay) return EFAULT when tar calls `fchmodat(AT_SYMLINK_NOFOLLOW)` on
+   * them, so tar exits 2 even though every file extracted correctly. We log
+   * the first lines of stderr if anything was reported, then let downstream
+   * validation (python --version, venv create, pip install) decide whether the
+   * extraction was actually usable.
+   */
+  private async extractTarballIgnoringExit(srcTarball: string, destDir: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const child = spawn('tar', ['-xzf', srcTarball, '-C', destDir], {
+        stdio: ['ignore', 'ignore', 'pipe'],
+      });
+      let stderrBuf = '';
+      child.stderr.on('data', (chunk: Buffer) => {
+        if (stderrBuf.length < 4096) stderrBuf += chunk.toString();
+      });
+      child.on('error', (err) => reject(err));
+      child.on('close', (code) => {
+        if (code !== 0) {
+          const head = stderrBuf
+            .split('\n')
+            .slice(0, 3)
+            .filter(Boolean)
+            .join(' | ');
+          this.log.debug(
+            `[bootstrap] tar exited ${code} during extract (continuing — downstream validation will catch real corruption). First stderr lines: ${head}`,
+          );
+        }
+        resolve();
+      });
+    });
   }
 
   private async downloadWithHash(url: string, destPath: string): Promise<string> {
