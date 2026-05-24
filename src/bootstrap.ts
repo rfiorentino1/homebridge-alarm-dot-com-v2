@@ -155,26 +155,23 @@ export class Bootstrap {
       );
     }
 
-    // Extract into the managed python dir. The install_only tarball contains a
-    // top-level `python/` directory with `bin/`, `lib/`, etc. We extract into a
-    // staging dir and then move into place atomically-ish.
+    // Extract into the state dir. The install_only tarball contains a top-level
+    // `python/` directory, so this produces `<stateDir>/python/` == managedPythonDir.
+    // We extract directly (rather than staging in /tmp and renaming) because
+    // `/tmp` is typically on the container overlay while stateDir is on a
+    // bind-mounted host volume — a cross-fs rename would fail with EXDEV.
     //
     // tar may exit non-zero on some hosts (e.g. QNAP's Docker bind-mounted
     // overlay returns EFAULT when tar tries to chmod symlinks inside terminfo).
     // The actual file data extracts fine in those cases, so we ignore tar's
     // exit code and rely on the downstream validation (python --version + venv
     // create + pip install) to catch genuine corruption.
-    const stagingDir = await fs.mkdtemp(pathJoin(tmpdir(), 'hb-adc-pyx-'));
-    this.log.debug(`[bootstrap] extracting ${tmpTarball} -> ${stagingDir}`);
-    await this.extractTarballIgnoringExit(tmpTarball, stagingDir);
-
-    // Remove any pre-existing managed install (e.g. failed prior attempt).
     await fs.rm(this.managedPythonDir, { recursive: true, force: true });
-    await fs.mkdir(pathResolve(this.managedPythonDir, '..'), { recursive: true });
-    await fs.rename(pathJoin(stagingDir, 'python'), this.managedPythonDir);
+    await fs.mkdir(this.stateDir, { recursive: true });
+    this.log.debug(`[bootstrap] extracting ${tmpTarball} -> ${this.stateDir}`);
+    await this.extractTarballIgnoringExit(tmpTarball, this.stateDir);
 
     // Clean up tmp.
-    await fs.rm(stagingDir, { recursive: true, force: true });
     await fs.rm(pathResolve(tmpTarball, '..'), { recursive: true, force: true });
 
     if (!(await this.pathSatisfiesMinVersion(this.managedPython))) {
