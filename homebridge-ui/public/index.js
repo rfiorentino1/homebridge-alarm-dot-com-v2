@@ -289,6 +289,16 @@
 
   async function boot() {
     wireEvents();
+    // Show the schema-driven form (Expose Security Panel, Contact Sensors,
+    // Motion Sensors, bypass, advanced options, etc.) underneath the custom
+    // UI. homebridge-config-ui-x hides it by default when customUi:true is
+    // set, and we want both visible — the custom UI is just a wizard for the
+    // credential/2FA flow.
+    try {
+      if (homebridge.showSchemaForm) homebridge.showSchemaForm();
+    } catch (e) {
+      // older homebridge-config-ui-x: schema form is shown by default.
+    }
     await loadExistingConfig();
     if (hasConfiguredAccount()) {
       showConnectedStep();
