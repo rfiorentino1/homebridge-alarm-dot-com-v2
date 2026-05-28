@@ -1,7 +1,7 @@
 {
   "name": "homebridge-alarm-dot-com-v2",
   "displayName": "Alarm.com v2",
-  "version": "1.3.3",
+  "version": "1.3.4",
   "description": "Event-driven Homebridge plugin for Alarm.com-backed security systems (ADT Control, ADT Command, ADT+, Brinks, and other Alarm.com-powered platforms). Exposes the security panel, contact sensors, motion sensors, locks, lights, thermostats, garage doors, gates, leak sensors, and water valves to HomeKit.",
   "license": "MIT",
   "author": "Rocco Fiorentino",
