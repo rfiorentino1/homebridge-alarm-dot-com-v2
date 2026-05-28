@@ -75,14 +75,33 @@
     }
   },
   "layout": [
-    { "type": "help", "helpvalue": "<h5 class='mt-3 mb-2'>Devices to Expose in HomeKit</h5>" },
-    "exposeSecurityPanel",
-    "exposeContactSensors",
-    "exposeMotionSensors",
-    "armAwayKeypadBypass",
-    { "type": "help", "helpvalue": "<h5 class='mt-4 mb-2'>Advanced</h5><p class='text-muted small mb-2'>Most users can leave these alone.</p>" },
-    "logLevel",
-    "mfaCookie",
-    "pythonPath"
+    {
+      "type": "section",
+      "title": "Devices to Expose",
+      "expandable": true,
+      "expanded": true,
+      "items": [
+        {
+          "items": [
+            "exposeSecurityPanel",
+            "exposeContactSensors",
+            "exposeMotionSensors",
+            "armAwayKeypadBypass"
+          ]
+        }
+      ]
+    },
+    {
+      "type": "section",
+      "title": "Advanced (Optional)",
+      "expandable": true,
+      "expanded": false,
+      "items": [
+        {
+          "description": "These settings are not required for most users.",
+          "items": ["mfaCookie", "pythonPath", "logLevel"]
+        }
+      ]
+    }
   ]
 }
