@@ -40,6 +40,17 @@ def _emit(payload: dict[str, Any]) -> None:
     sys.stdout.flush()
 
 
+def _trace(stage: str, **kw: Any) -> None:
+    # Stderr breadcrumbs so the UI server (and homebridge log) shows exactly
+    # which phase the helper reached, even if the lib hangs and the helper
+    # never returns. Tag is short and grep-friendly.
+    parts = [f"[adc-ui-auth] {stage}"]
+    for k, v in kw.items():
+        parts.append(f"{k}={v}")
+    sys.stderr.write(" ".join(parts) + "\n")
+    sys.stderr.flush()
+
+
 def _err(error: str, kind: str = "unknown") -> dict[str, Any]:
     return {"ok": False, "error": error, "error_kind": kind}
 
@@ -66,13 +77,16 @@ def _read_jar_cookie(bridge) -> str:
 async def action_discover(payload: dict[str, Any]) -> dict[str, Any]:
     from pyalarmdotcomajax.exceptions import OtpRequired, AuthenticationFailed
 
+    _trace("discover:build-bridge", user=payload.get("username", ""))
     bridge = await _build_bridge(
         payload["username"], payload["password"], payload.get("mfa_cookie", "")
     )
     try:
         try:
+            _trace("discover:login")
             await bridge.login()
         except OtpRequired as e:
+            _trace("discover:otp-required", methods=[m.name for m in e.enabled_2fa_methods])
             methods = [m.name for m in e.enabled_2fa_methods]
             hints: dict[str, str] = {}
             email = getattr(e, "email", None)
@@ -89,9 +103,12 @@ async def action_discover(payload: dict[str, Any]) -> dict[str, Any]:
                 "username": payload["username"],
             }
         except AuthenticationFailed as e:
+            _trace("discover:auth-failed")
             return _err(f"Login failed: {e or 'invalid credentials'}", "auth")
+        _trace("discover:ok-no-2fa")
         return {"ok": True}
     finally:
+        _trace("discover:close")
         await _close_bridge(bridge)
 
 
@@ -104,19 +121,27 @@ async def action_request_otp(payload: dict[str, Any]) -> dict[str, Any]:
         return _err(f"Unknown method: {method}", "unknown")
     otp_type = {"sms": OtpType.sms, "email": OtpType.email, "app": OtpType.app}[method]
 
+    _trace("request_otp:build-bridge", method=method)
     bridge = await _build_bridge(payload["username"], payload["password"])
     try:
         try:
+            _trace("request_otp:login")
             await bridge.login()
         except OtpRequired:
-            pass  # expected
+            _trace("request_otp:login-otp-required (expected)")
         except AuthenticationFailed as e:
+            _trace("request_otp:auth-failed")
             return _err(f"Login failed: {e or 'invalid credentials'}", "auth")
         # request_otp is a no-op for TOTP (the user's authenticator already has codes).
         if otp_type in (OtpType.email, OtpType.sms):
+            _trace("request_otp:sending", method=method)
             await bridge.auth_controller.request_otp(otp_type)
+            _trace("request_otp:sent", method=method)
+        else:
+            _trace("request_otp:skip-totp")
         return {"ok": True, "method": method}
     finally:
+        _trace("request_otp:close")
         await _close_bridge(bridge)
 
 
@@ -134,33 +159,43 @@ async def action_submit_otp(payload: dict[str, Any]) -> dict[str, Any]:
         return _err("Missing OTP code", "code")
     device_name = payload.get("device_name") or "Homebridge"
 
+    _trace("submit_otp:build-bridge", method=method)
     bridge = await _build_bridge(payload["username"], payload["password"])
     try:
         try:
+            _trace("submit_otp:login")
             await bridge.login()
         except OtpRequired:
-            pass
+            _trace("submit_otp:login-otp-required (expected)")
         except AuthenticationFailed as e:
+            _trace("submit_otp:auth-failed")
             return _err(f"Login failed: {e or 'invalid credentials'}", "auth")
         try:
+            _trace("submit_otp:submitting")
             await bridge.auth_controller.submit_otp(code, otp_type, device_name=device_name)
+            _trace("submit_otp:submitted")
         except Exception as e:
             # submit_otp may raise UnexpectedResponse even when the OTP was accepted
             # and the cookie was set in the jar; treat as soft-failure and check the jar.
+            _trace("submit_otp:submit-raised", err=type(e).__name__)
             cookie_from_jar = _read_jar_cookie(bridge)
             if cookie_from_jar:
+                _trace("submit_otp:cookie-from-jar-after-raise")
                 return {"ok": True, "cookie": cookie_from_jar}
             kind = "code" if "code" in str(e).lower() or "verif" in str(e).lower() else "cookie"
             return _err(f"submit_otp failed: {e}", kind)
         cookie_from_jar = _read_jar_cookie(bridge)
         if cookie_from_jar:
+            _trace("submit_otp:cookie-from-jar")
             return {"ok": True, "cookie": cookie_from_jar}
+        _trace("submit_otp:no-cookie")
         return _err(
             "OTP accepted but no trusted-device cookie was set. "
             "Your Alarm.com account may not allow trusted devices.",
             "cookie",
         )
     finally:
+        _trace("submit_otp:close")
         await _close_bridge(bridge)
 
 

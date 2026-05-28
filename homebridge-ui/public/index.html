@@ -6,6 +6,16 @@
 </head>
 <body>
   <div id="root" class="container-fluid p-3">
+    <!-- Step: Already-connected landing -->
+    <section data-step="connected" hidden>
+      <h5 class="mb-2 text-success">Connected to Alarm.com</h5>
+      <p class="mb-2">
+        Signed in as <strong id="connected-username">…</strong>.
+      </p>
+      <p class="text-muted small mb-3" id="connected-detail"></p>
+      <button id="btn-resign" class="btn btn-secondary" type="button">Sign in again</button>
+    </section>
+
     <!-- Step: Welcome / login form -->
     <section data-step="idle" hidden>
       <h5 class="mb-2">Sign in to Alarm.com</h5>
@@ -30,6 +40,12 @@
     <section data-step="logging-in" hidden>
       <h5 class="mb-2">Signing in…</h5>
       <p class="text-muted small">Contacting Alarm.com.</p>
+    </section>
+
+    <!-- Step: Sending OTP -->
+    <section data-step="sending-otp" hidden>
+      <h5 class="mb-2">Sending code…</h5>
+      <p class="text-muted small" id="sending-otp-detail">Asking Alarm.com to send the verification code.</p>
     </section>
 
     <!-- Step: OTP method picker -->
