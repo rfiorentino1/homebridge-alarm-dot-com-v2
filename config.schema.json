@@ -76,7 +76,7 @@
   },
   "layout": [
     {
-      "type": "section",
+      "type": "fieldset",
       "title": "Devices to Expose",
       "expandable": true,
       "expanded": true,
@@ -92,7 +92,7 @@
       ]
     },
     {
-      "type": "section",
+      "type": "fieldset",
       "title": "Advanced (Optional)",
       "expandable": true,
       "expanded": false,
