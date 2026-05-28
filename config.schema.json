@@ -3,24 +3,20 @@
   "pluginType": "platform",
   "singular": true,
   "customUi": true,
-  "headerDisplay": "Event-driven Homebridge plugin for Alarm.com-backed security systems (ADT Control, ADT Command, ADT+, Brinks, and others). On first run the plugin sets up its own private Python environment under the Homebridge storage dir, downloading a portable CPython 3.13 if your host doesn't already have one. No system Python setup required.",
-  "footerDisplay": "If your account has 2FA enabled, use the Sign in screen above to capture a trusted-device cookie — no terminal access needed. Existing installs can keep using the manually-captured `mfaCookie` value.",
+  "headerDisplay": "Event-driven Homebridge plugin for Alarm.com-backed security systems (ADT Control, ADT Command, ADT+, Brinks, and others). Use the Sign in panel above to enter credentials and (if enabled) capture a 2FA trusted-device cookie. The settings below control what gets exposed to HomeKit and a few advanced overrides.",
+  "footerDisplay": "On first run the plugin sets up its own private Python environment under the Homebridge storage dir, downloading a portable CPython 3.13 if your host doesn't already have one. No system Python setup required.",
   "schema": {
     "type": "object",
     "properties": {
       "username": {
         "title": "Email",
         "type": "string",
-        "required": true,
-        "placeholder": "you@example.com",
-        "description": "Your Alarm.com (or ADT Control / ADT+) login email."
+        "description": "Managed by the Sign in panel above."
       },
       "password": {
         "title": "Password",
         "type": "string",
-        "required": true,
-        "placeholder": "Alarm.com password",
-        "description": "Your Alarm.com account password.",
+        "description": "Managed by the Sign in panel above.",
         "x-schema-form": {
           "type": "password"
         }
@@ -48,10 +44,9 @@
         "description": "When Home.app requests Arm, faulted zones will be bypassed. Leave off for most setups."
       },
       "mfaCookie": {
-        "title": "2FA Remember-Me Cookie",
+        "title": "2FA Remember-Me Cookie (manual override)",
         "type": "string",
-        "placeholder": "Paste cookie from pyalarmdotcomajax CLI",
-        "description": "Only needed if your account has 2FA enabled. See footer for how to capture.",
+        "description": "Normally captured automatically by the Sign in panel above. Only edit if you have a cookie from another tool.",
         "x-schema-form": {
           "type": "password"
         }
@@ -63,7 +58,7 @@
       "pythonPath": {
         "title": "Python executable path",
         "type": "string",
-        "description": "Override the detected Python 3.13+ binary. Leave blank for auto-detect."
+        "description": "Override the auto-detected Python 3.13+ binary. Leave blank for auto-detect."
       },
       "logLevel": {
         "title": "Log verbosity",
@@ -80,45 +75,14 @@
     }
   },
   "layout": [
-    {
-      "type": "section",
-      "title": "Alarm.com Credentials",
-      "expandable": false,
-      "expanded": true,
-      "items": [
-        {
-          "description": "Sign in with the same credentials you use for the Alarm.com (or ADT Control / ADT+) app.",
-          "items": ["username", "password"]
-        }
-      ]
-    },
-    {
-      "type": "section",
-      "title": "Devices to Expose",
-      "expandable": true,
-      "expanded": true,
-      "items": [
-        {
-          "items": [
-            "exposeSecurityPanel",
-            "exposeContactSensors",
-            "exposeMotionSensors",
-            "armAwayKeypadBypass"
-          ]
-        }
-      ]
-    },
-    {
-      "type": "section",
-      "title": "Advanced (Optional)",
-      "expandable": true,
-      "expanded": false,
-      "items": [
-        {
-          "description": "These settings are not required for most users.",
-          "items": ["mfaCookie", "pythonPath", "logLevel"]
-        }
-      ]
-    }
+    { "type": "help", "helpvalue": "<h5 class='mt-3 mb-2'>Devices to Expose in HomeKit</h5>" },
+    "exposeSecurityPanel",
+    "exposeContactSensors",
+    "exposeMotionSensors",
+    "armAwayKeypadBypass",
+    { "type": "help", "helpvalue": "<h5 class='mt-4 mb-2'>Advanced</h5><p class='text-muted small mb-2'>Most users can leave these alone.</p>" },
+    "logLevel",
+    "mfaCookie",
+    "pythonPath"
   ]
 }
