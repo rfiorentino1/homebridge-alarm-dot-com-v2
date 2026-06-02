@@ -88,6 +88,7 @@ from pyalarmdotcomajax.models.water_valve import (  # type: ignore[import-untype
 )
 from pyalarmdotcomajax.websocket.client import (  # type: ignore[import-untyped]
     RawResourceEventMessage,
+    WebSocketState,
 )
 from pyalarmdotcomajax.websocket.messages import (  # type: ignore[import-untyped]
     ResourceEventType,
@@ -513,6 +514,24 @@ BRIDGE_CALL_TIMEOUT_S = 25.0
 LIVENESS_TIMEOUT_S = 60.0
 WATCHDOG_INTERVAL_S = 15.0
 
+# WS-connection health (separate from the reconcile-liveness watchdog above,
+# which is BLIND to a dead WebSocket while REST keeps succeeding — the
+# 2026-06-02 freeze). If the pyalarmdotcomajax WebSocketClient reports itself
+# not-connected for this long, force a true rebuild. Generous enough to let the
+# lib's own internal reconnect (10*attempts backoff, up to 30min) reconnect a
+# transient blip first, but far short of "never" — a DEAD controller (lib gave
+# up after its 25 attempts) is force-rebuilt immediately, no wait.
+WS_DOWN_RECONNECT_S = 120.0
+
+# How long REST must *persistently* contradict the WS-authoritative cache before
+# we distrust the cache (presume the WS is dead/zombie) and let REST drive +
+# trigger a WS rebuild. Must sit safely beyond alarm.com's known 5-10min REST
+# lag so a normal lagging/double-firing REST value never trips it — that lag is
+# exactly what the authoritative cache exists to paper over (2026-05-09). Also
+# reused as the "WS was down long enough that state may have changed unobserved"
+# threshold for clearing the frozen cache on reconnect.
+AUTH_STALE_AFTER_S = 600.0
+
 # OS-level stall watchdog. Runs in a real OS thread so it stays alive even
 # when the asyncio event loop is wedged (e.g. by a synchronous-blocking call
 # deep in pyalarmdotcomajax during a half-open WS scenario). The async
@@ -547,6 +566,15 @@ class Daemon:
         # stall watchdog as proof that the asyncio loop itself is alive.
         self._last_successful_reconcile_at: float = 0.0
         self._last_event_at: float = 0.0
+        # WS-health tracking (watched by _watchdog_loop). _ws_disconnected_since
+        # is set when the WS controller first reports not-connected and cleared
+        # when it reconnects; _ws_rebuild_requested is a one-shot flag the
+        # reconcile staleness guard raises (it can't tear down its own task, so
+        # it asks the watchdog to do the rebuild). _partition_disagree_since
+        # tracks how long REST has contradicted each partition's cached WS state.
+        self._ws_disconnected_since: float | None = None
+        self._ws_rebuild_requested: bool = False
+        self._partition_disagree_since: dict[str, float] = {}
         self._heartbeat_at: float = time.monotonic()
         self._heartbeat_task: asyncio.Task | None = None
         self._stall_thread: threading.Thread | None = None
@@ -1064,6 +1092,9 @@ class Daemon:
         # its first reconcile before considering the connection stale.
         self._last_successful_reconcile_at = time.monotonic()
         self._last_event_at = time.monotonic()
+        # Fresh socket — drop any carried-over WS-down timer so the watchdog
+        # re-arms cleanly and gives this connection its full WS_DOWN_RECONNECT_S.
+        self._ws_disconnected_since = None
 
         # start_event_monitoring returns an optional stop handle; also opens the WS.
         self._stop_ws = await asyncio.wait_for(
@@ -1387,10 +1418,29 @@ class Daemon:
             except Exception:
                 pass
             self._stop_ws = None
+        # Explicitly stop the underlying pyalarmdotcomajax WebSocketClient. The
+        # daemon calls start_event_monitoring() WITHOUT a status callback, so it
+        # returns None and self._stop_ws above is always None — meaning nothing
+        # here actually tears the socket down. Worse, the controller's
+        # initialize() early-returns while _initialized is True, so a rebuild via
+        # _force_reconnect would just re-subscribe callbacks to the SAME (possibly
+        # DEAD/zombie) socket and never reconnect. stop() cancels its tasks and
+        # resets _initialized=False, so the next start truly reconnects — on
+        # whatever session is current (re-derived by the WS _authenticate()).
+        if self._bridge is not None:
+            with suppress(Exception):
+                self._bridge.ws_controller.stop()
 
-    async def _force_reconnect(self, reason: str) -> None:
+    async def _force_reconnect(self, reason: str, *, clear_auth_cache: bool = False) -> None:
         """Tear down + rebuild the WS subscription. Lock-protected so concurrent
-        triggers don't race."""
+        triggers don't race.
+
+        clear_auth_cache=True when the WS was down long enough (> AUTH_STALE_AFTER_S)
+        that arm/disarm or sensor state may have changed unobserved while the
+        WS-authoritative caches were frozen. The freshly-rebuilt WS only pushes on
+        the NEXT change, so without clearing, HomeKit would keep showing the
+        pre-outage state until someone re-armed. We drop the caches and let the
+        reconcile loop (next tick, <=10s) repopulate current truth from REST."""
         if self._reconnect_lock.locked():
             return
         async with self._reconnect_lock:
@@ -1399,6 +1449,18 @@ class Daemon:
             try:
                 await self._start_subscription_inner()
                 _emit_log("info", "websocket resubscribed cleanly")
+                if clear_auth_cache:
+                    # Deliberately do NOT clear _partition_alarm_active — leaving a
+                    # standing alarm sticky is the fail-safe direction; it clears on
+                    # a real Disarmed / AlarmCancelled push.
+                    self._authoritative_partition_state.clear()
+                    self._authoritative_sensor_state.clear()
+                    self._partition_disagree_since.clear()
+                    _emit_log(
+                        "info",
+                        "cleared WS-authoritative caches after extended WS outage; "
+                        "REST authoritative until fresh pushes arrive",
+                    )
             except Exception as e:
                 # Leave _subscribed = False so the next watchdog tick retries.
                 # Bridge auth state is preserved, so we don't need a full
@@ -1442,13 +1504,22 @@ class Daemon:
                 os._exit(1)
 
     async def _watchdog_loop(self) -> None:
-        """Liveness watchdog. Fires _force_reconnect when the reconcile loop
-        appears wedged (no successful reconcile within LIVENESS_TIMEOUT_S).
+        """Liveness watchdog.
 
-        Uses time-of-last-successful-reconcile rather than time-of-last-event
-        because CONNECTION_EVENT heartbeats from pyalarmdotcomajax arrive in
-        bursts every ~5min — too sparse to use as a tight liveness signal —
-        whereas a healthy reconcile loop runs every RECONCILE_INTERVAL_S.
+        Two independent failure modes are covered:
+
+          1. Reconcile wedged — no successful reconcile within LIVENESS_TIMEOUT_S
+             (a half-open REST/HTTP path). Uses time-of-last-successful-reconcile
+             rather than time-of-last-event because CONNECTION_EVENT heartbeats
+             from pyalarmdotcomajax arrive in bursts every ~5min — too sparse to
+             use as a tight liveness signal.
+
+          2. Dead WebSocket while REST is healthy — the 2026-06-02 freeze. The
+             reconcile-liveness check (1) is BLIND to this: REST keeps succeeding
+             so it never fires, but the WS-fed authoritative caches (arm/disarm,
+             alarm) are frozen. We watch the controller's own WebSocketState and
+             a persistent REST-vs-cache disagreement (flagged by reconcile via
+             _ws_rebuild_requested) and force a true rebuild.
         """
         while True:
             try:
@@ -1457,10 +1528,51 @@ class Daemon:
                     continue
                 if self._last_successful_reconcile_at == 0.0 and not self._subscribed:
                     continue
+
+                # (2a) Reconcile's staleness guard asked for a rebuild (it can't
+                # cancel its own task, so it delegates to us).
+                if self._ws_rebuild_requested:
+                    self._ws_rebuild_requested = False
+                    await self._force_reconnect(
+                        "WS-authoritative cache stale vs REST (websocket presumed dead)"
+                    )
+                    continue
+
+                # (2b) WebSocket controller health, independent of REST liveness.
+                if self._subscribed:
+                    ws = self._bridge.ws_controller
+                    if ws.state == WebSocketState.DEAD:
+                        # The lib exhausted its 25 internal reconnect attempts and
+                        # gave up permanently — only a fresh initialize() revives
+                        # it, and it's certainly been down for many minutes.
+                        self._ws_disconnected_since = None
+                        await self._force_reconnect(
+                            "websocket controller DEAD (lib exhausted its reconnects)",
+                            clear_auth_cache=True,
+                        )
+                        continue
+                    if not ws.connected:
+                        if self._ws_disconnected_since is None:
+                            self._ws_disconnected_since = time.monotonic()
+                        else:
+                            down_for = time.monotonic() - self._ws_disconnected_since
+                            if down_for > WS_DOWN_RECONNECT_S:
+                                self._ws_disconnected_since = None
+                                await self._force_reconnect(
+                                    f"websocket down {down_for:.0f}s "
+                                    f"(state={ws.state.name}, threshold {int(WS_DOWN_RECONNECT_S)}s)",
+                                    clear_auth_cache=down_for > AUTH_STALE_AFTER_S,
+                                )
+                                continue
+                    else:
+                        self._ws_disconnected_since = None
+
+                # (1) Reconcile-liveness.
                 age = time.monotonic() - self._last_successful_reconcile_at
                 if age > LIVENESS_TIMEOUT_S:
                     await self._force_reconnect(
-                        f"no successful reconcile in {age:.0f}s (threshold {int(LIVENESS_TIMEOUT_S)}s)"
+                        f"no successful reconcile in {age:.0f}s (threshold {int(LIVENESS_TIMEOUT_S)}s)",
+                        clear_auth_cache=age > AUTH_STALE_AFTER_S,
                     )
                     continue
                 if not self._subscribed:
@@ -1657,6 +1769,40 @@ class Daemon:
             dc._refresh(), timeout=BRIDGE_CALL_TIMEOUT_S
         )
         self._last_successful_reconcile_at = time.monotonic()
+
+        # WS-authoritative staleness guard. _build_partition_wire prefers the
+        # WS-pushed cache over REST so a lagging / double-firing REST value can't
+        # flip arm/disarm (2026-05-09). But if the WS silently dies, that cache
+        # freezes and REST — now the only live truth — is suppressed forever
+        # (2026-06-02: arm/disarm stuck for ~12h while sensors kept updating).
+        # Detect a cached partition value that REST has contradicted for longer
+        # than the known REST lag, drop the stale entry so REST drives the wire
+        # built just below, and ask the watchdog to rebuild the WS (restoring
+        # real-time push + the alarm-trigger path, which is WS-only). The long
+        # AUTH_STALE_AFTER_S window means a normal lagging REST value self-heals
+        # before it ever trips this, so the anti-flip protection is preserved.
+        now = time.monotonic()
+        for p in bridge.partitions:
+            rid = str(p.id)
+            cached = self._authoritative_partition_state.get(rid)
+            rest_state = p.attributes.state
+            if cached is None or rest_state is None or rest_state == cached:
+                self._partition_disagree_since.pop(rid, None)
+                continue
+            since = self._partition_disagree_since.get(rid)
+            if since is None:
+                self._partition_disagree_since[rid] = now
+            elif now - since > AUTH_STALE_AFTER_S:
+                _emit_log(
+                    "warn",
+                    f"WS-authoritative partition {rid} stale: cache={cached.name} but "
+                    f"REST={rest_state.name} for {now - since:.0f}s — dropping cache "
+                    "(websocket presumed dead) and forcing WS rebuild",
+                )
+                self._authoritative_partition_state.pop(rid, None)
+                self._partition_disagree_since.pop(rid, None)
+                self._ws_rebuild_requested = True
+
         current = {d["id"]: d for d in self._snapshot_devices()}
         changes = 0
         for device_id, wire in current.items():
