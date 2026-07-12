@@ -532,6 +532,20 @@ WS_DOWN_RECONNECT_S = 120.0
 # threshold for clearing the frozen cache on reconnect.
 AUTH_STALE_AFTER_S = 600.0
 
+# Sensor-cache version of the staleness guard. A contact/motion sensor's
+# WS-authoritative cache can get stuck at OPEN when the matching close arrives
+# as a merged OPENED_CLOSED event (which on_raw_event deliberately does NOT
+# cache) instead of a discrete Closed — so the cache is never corrected to
+# CLOSED and, because it overrides REST, HomeKit stays pinned Open forever even
+# though ADC's REST says Closed (observed 2026-07-12, garage). Unlike partitions
+# (5-10min arm/disarm REST lag → 600s window + WS rebuild), a sensor's true
+# state settles in REST within seconds (the OPENED_CLOSED recovery poll sees
+# Closed in ~6s, 30s timeout worst case), and a stale-open sensor should self-
+# heal in seconds not minutes — so this window is short and does NOT trigger a
+# WS rebuild (the WS is fine; it just delivered a merged event). Sits safely
+# beyond the 30s OPENED_CLOSED recovery window so the poll owns the sensor first.
+SENSOR_AUTH_STALE_AFTER_S = 45.0
+
 # OS-level stall watchdog. Runs in a real OS thread so it stays alive even
 # when the asyncio event loop is wedged (e.g. by a synchronous-blocking call
 # deep in pyalarmdotcomajax during a half-open WS scenario). The async
@@ -602,6 +616,11 @@ class Daemon:
         # because the socket blipped). Cleared only on daemon restart.
         self._authoritative_partition_state: dict[str, PartitionState] = {}
         self._authoritative_sensor_state: dict[str, SensorState] = {}
+        # Sensor analogue of _partition_disagree_since: tracks how long a sensor's
+        # WS-authoritative cache (OPEN) has persistently disagreed with settled
+        # REST (Closed), so the reconcile guard can drop a stuck-open cache entry
+        # after SENSOR_AUTH_STALE_AFTER_S and let REST self-heal HomeKit.
+        self._sensor_disagree_since: dict[str, float] = {}
         # ALARM-STATE CACHE. Keyed by partition id; True while an alarm /
         # pending-alarm / panic is standing. Alarm.com's PartitionState enum
         # has no alarm member (an alarm is a separate flag) and a PendingAlarm
@@ -1456,6 +1475,7 @@ class Daemon:
                     self._authoritative_partition_state.clear()
                     self._authoritative_sensor_state.clear()
                     self._partition_disagree_since.clear()
+                    self._sensor_disagree_since.clear()
                     _emit_log(
                         "info",
                         "cleared WS-authoritative caches after extended WS outage; "
@@ -1685,6 +1705,19 @@ class Daemon:
         sensor = bridge.sensors.get(sensor_id)
         if sensor is None:
             return
+        # Correct the WS-authoritative cache to CLOSED. The open that started this
+        # recovery set the cache to OPEN (via a discrete Opened), but the matching
+        # close arrived as a merged OPENED_CLOSED that on_raw_event does NOT cache
+        # — so without this the cache stays OPEN and the next reconcile re-opens
+        # the sensor in HomeKit, flip-flopping it stuck-open (observed 2026-07-12,
+        # garage). We've just confirmed REST-Closed (or hit the safety timeout),
+        # so CLOSED is the truth; a genuine re-open fires a fresh Opened that
+        # re-sets the cache. Motion sensors use IDLE as their "closed" analogue.
+        subtype = getattr(sensor.attributes, "device_type", None)
+        self._authoritative_sensor_state[sensor_id] = (
+            SensorState.IDLE if subtype in MOTION_SUBTYPES else SensorState.CLOSED
+        )
+        self._sensor_disagree_since.pop(sensor_id, None)
         wire = self._build_sensor_wire_contact(sensor)
         # Force closed: the bridge's cached state may still be OPENED_CLOSED, in
         # which case _derive_closed falls through to the closed default — but we
@@ -1802,6 +1835,47 @@ class Daemon:
                 self._authoritative_partition_state.pop(rid, None)
                 self._partition_disagree_since.pop(rid, None)
                 self._ws_rebuild_requested = True
+
+        # Sensor-cache staleness guard (contact sensors) — the sensor analogue of
+        # the partition guard above. A contact sensor's WS-authoritative cache can
+        # get stuck at OPEN when its close arrives as a merged OPENED_CLOSED event
+        # (which on_raw_event does NOT cache) instead of a discrete Closed; the
+        # stale OPEN then overrides settled REST on every reconcile and HomeKit
+        # stays pinned Open forever (observed 2026-07-12, garage). If the cache
+        # disagrees with settled REST for > SENSOR_AUTH_STALE_AFTER_S, drop the
+        # stale entry so REST drives the wire built just below. We do NOT trigger a
+        # WS rebuild here (unlike partitions) — the socket is healthy; it simply
+        # delivered a merged event. Sensors with an in-flight OPENED_CLOSED
+        # recovery poll are skipped: that task owns the sensor until it resolves.
+        # Scoped to contact sensors (the observed failure); motion (ACTIVE/IDLE)
+        # keeps its existing clearing path untouched.
+        for s in bridge.sensors:
+            if getattr(s.attributes, "device_type", None) not in CONTACT_SUBTYPES:
+                continue
+            rid = str(s.id)
+            cached = self._authoritative_sensor_state.get(rid)
+            pending = self._pending_synthetic_close.get(rid)
+            if cached is None or (pending is not None and not pending.done()):
+                self._sensor_disagree_since.pop(rid, None)
+                continue
+            cache_closed = cached == SensorState.CLOSED
+            rest_closed = _derive_closed(s)
+            if cache_closed == rest_closed:
+                self._sensor_disagree_since.pop(rid, None)
+                continue
+            since = self._sensor_disagree_since.get(rid)
+            if since is None:
+                self._sensor_disagree_since[rid] = now
+            elif now - since > SENSOR_AUTH_STALE_AFTER_S:
+                _emit_log(
+                    "warn",
+                    f"WS-authoritative sensor {rid} stale: cache={cached.name} but "
+                    f"REST={'Closed' if rest_closed else 'Open'} for {now - since:.0f}s "
+                    "— dropping stale cache entry (likely a merged OPENED_CLOSED "
+                    "close); REST now drives HomeKit",
+                )
+                self._authoritative_sensor_state.pop(rid, None)
+                self._sensor_disagree_since.pop(rid, None)
 
         current = {d["id"]: d for d in self._snapshot_devices()}
         changes = 0
